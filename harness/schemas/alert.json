@@ -1,0 +1,157 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://triage-harness/schemas/alert.json",
+  "title": "Enriched Dependabot alert",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "alert_key",
+    "repo",
+    "ghsa_id",
+    "purl",
+    "ecosystem",
+    "manifest_path",
+    "gh_alert_num",
+    "first_seen_at",
+    "last_seen_at",
+    "state"
+  ],
+  "properties": {
+    "alert_key": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$",
+      "description": "sha256(ghsa_id|purl|resolved_version|manifest_path|repo)"
+    },
+    "repo": {
+      "type": "string",
+      "pattern": "^[^/]+/[^/]+$"
+    },
+    "ghsa_id": {
+      "type": "string",
+      "minLength": 1,
+      "pattern": "^(GHSA|CVE|GO|PYSEC|RUSTSEC|OSV|MAL|GSD|UBUNTU|DSA|RHSA|ALSA)-",
+      "description": "Advisory identifier. GHSA where GitHub has one, otherwise the OSV-native id (Go advisories are frequently GO-xxxx with no GHSA alias)."
+    },
+    "cve_id": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "pattern": "^CVE-[0-9]{4}-[0-9]+$"
+    },
+    "purl": {
+      "type": "string",
+      "pattern": "^pkg:"
+    },
+    "ecosystem": {
+      "type": "string",
+      "minLength": 1
+    },
+    "resolved_ver": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "patched_ver": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "manifest_path": {
+      "type": "string"
+    },
+    "dep_scope": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "enum": [
+        "runtime",
+        "development",
+        "unknown",
+        null
+      ],
+      "description": "Resolved from the manifest, not from the Dependabot payload"
+    },
+    "is_direct": {
+      "type": [
+        "boolean",
+        "null"
+      ],
+      "description": "null means undecidable from the manifest, not false"
+    },
+    "cvss_score": {
+      "type": [
+        "number",
+        "null"
+      ],
+      "minimum": 0,
+      "maximum": 10
+    },
+    "cvss_vector": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "severity": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "enum": [
+        "none",
+        "low",
+        "moderate",
+        "medium",
+        "high",
+        "critical",
+        null
+      ]
+    },
+    "epss_score": {
+      "type": [
+        "number",
+        "null"
+      ],
+      "minimum": 0,
+      "maximum": 1
+    },
+    "in_kev": {
+      "type": [
+        "boolean",
+        "null"
+      ]
+    },
+    "gh_alert_num": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "first_seen_at": {
+      "type": "string"
+    },
+    "last_seen_at": {
+      "type": "string"
+    },
+    "state": {
+      "type": "string",
+      "enum": [
+        "open",
+        "fixed",
+        "dismissed"
+      ]
+    },
+    "symbols": {
+      "type": [
+        "array",
+        "null"
+      ],
+      "items": {
+        "type": "string"
+      },
+      "description": "OSV ecosystem_specific.imports. null/empty caps reachability at level 2 and confidence at 0.5 (\u00a714.5)"
+    }
+  }
+}

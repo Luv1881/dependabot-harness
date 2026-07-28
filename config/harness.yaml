@@ -1,0 +1,69 @@
+github:
+  # App auth (preferred). Falls back to ${GH_TOKEN} PAT if app_id is unset.
+  app_id: ${GH_APP_ID}
+  installation_id: ${GH_INSTALLATION_ID}
+  private_key_path: ${GH_PRIVATE_KEY_PATH}
+  org: my-org
+  repos:                       # explicit allowlist; no wildcard discovery in v1
+    - my-org/service-a
+    - my-org/service-b
+
+models:
+  # Deliberately different models for judgment vs validation (§11).
+  # Startup asserts (judgment.provider, judgment.model) != (validator.provider, validator.model).
+  recon:
+    provider: anthropic
+    model: claude-haiku-4-5
+    context_window: 200000
+    max_context_fraction: 0.25
+  judgment:
+    provider: anthropic
+    model: claude-opus-5
+    context_window: 1000000
+    max_context_fraction: 0.25
+  validator:
+    provider: anthropic          # set to `openai` for cross-provider divergence
+    model: claude-sonnet-5
+    context_window: 1000000
+    max_context_fraction: 0.25
+  dedup:
+    provider: anthropic
+    model: claude-haiku-4-5
+    context_window: 200000
+    max_context_fraction: 0.25
+
+budgets:
+  per_repo_usd: 5.00
+  per_alert_usd: 0.40
+  per_run_usd: 100.00
+  judgment_max_tool_calls: 8
+  on_breach: queue_next_run    # queue_next_run | fail | warn
+
+cache:
+  dir: ./out/cache
+  architecture_ttl_days: 30
+  verdict_ttl_days: 90
+  invalidate_architecture_on_paths:
+    - "**/go.mod"
+    - "**/package.json"
+    - "**/pom.xml"
+    - "**/requirements*.txt"
+    - "**/Dockerfile"
+    - "**/*.tf"
+    - "**/routes/**"
+    - "**/handlers/**"
+
+storage:
+  db_path: ./out/harness.db
+  checkout_dir: ./out/checkouts
+
+output:
+  vex_dir: ./out/vex
+  sarif_dir: ./out/sarif
+  auto_dismiss: true
+  # All three keys are mandatory. Omitting any of them makes the gate refuse to
+  # dismiss rather than treating the omission as satisfied.
+  auto_dismiss_requires:
+    verdict: not_affected
+    confidence_min: 0.85
+    validator_agreed: true

@@ -1,0 +1,71 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://triage-harness/schemas/architecture.json",
+  "title": "Repository architecture",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["repo", "summary", "entry_points", "build_targets", "deployment", "confidence"],
+  "properties": {
+    "repo": { "type": "string" },
+    "commit_sha": { "type": "string" },
+    "summary": { "type": "string", "minLength": 1 },
+    "entry_points": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["kind", "path"],
+        "properties": {
+          "kind": { "type": "string" },
+          "path": { "type": "string" },
+          "symbol": { "type": ["string", "null"] },
+          "exposure": {
+            "type": ["string", "null"],
+            "enum": ["internet", "internal", "local", "unknown", null]
+          },
+          "authenticated": { "type": ["boolean", "null"] },
+          "notes": { "type": ["string", "null"] }
+        }
+      }
+    },
+    "trust_boundaries": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["name"],
+        "properties": {
+          "name": { "type": "string" },
+          "untrusted_input": { "type": ["boolean", "null"] },
+          "controls": { "type": "array", "items": { "type": "string" } }
+        }
+      }
+    },
+    "build_targets": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["name"],
+        "properties": {
+          "name": { "type": "string" },
+          "entry": { "type": ["string", "null"] },
+          "ships_to_prod": { "type": ["boolean", "null"] }
+        }
+      }
+    },
+    "input_sources": { "type": "array", "items": { "type": "string" } },
+    "deployment": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "in_production": { "type": ["boolean", "null"] },
+        "internet_facing": { "type": ["boolean", "null"] },
+        "replicas": { "type": ["string", "null"] }
+      }
+    },
+    "notable_frameworks": { "type": "array", "items": { "type": "string" } },
+    "confidence": { "type": "number", "minimum": 0, "maximum": 1 },
+    "gaps": { "type": "array", "items": { "type": "string" } }
+  }
+}

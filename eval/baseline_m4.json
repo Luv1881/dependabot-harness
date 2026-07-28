@@ -1,0 +1,53 @@
+{
+  "split": "tune",
+  "total_cases": 97,
+  "decidable_cases": 87,
+  "dataset_fingerprint": "39e2fb4a6d062696",
+  "abstention_on_reachable_rate": 0.1429,
+  "false_negative_rate": 0.0,
+  "false_negatives": 0,
+  "false_positive_rate": 0.2368,
+  "false_positives": 9,
+  "could_not_determine_rate": 0.0805,
+  "precision": 0.8235,
+  "recall": 0.8571,
+  "mean_cost_per_alert_usd": 0.0,
+  "validator_disagreement_rate": 0.0,
+  "confusion": {
+    "true_positive": 42,
+    "false_positive": 9,
+    "true_negative": 29,
+    "false_negative": 0
+  },
+  "decided_by": {
+    "policy": 49,
+    "evidence": 38,
+    "unresolved": 10
+  },
+  "false_negative_cases": [],
+  "predictor": "deterministic",
+  "dataset": {
+    "total": 120,
+    "scored": 97,
+    "labels": {
+      "not_reachable": 48,
+      "reachable": 60,
+      "unsure": 12
+    },
+    "ecosystems": {
+      "go": 24,
+      "npm": 24,
+      "pip": 24,
+      "maven": 24,
+      "cargo": 24
+    },
+    "hand_labeled": 0,
+    "synthetic": 120
+  },
+  "accept_gate": {
+    "requires_hand_labeled_cases": 100,
+    "hand_labeled_present": 0,
+    "satisfied": false,
+    "note": "baseline is synthetic-only and cannot satisfy the M4 gate"
+  }
+}

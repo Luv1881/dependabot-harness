@@ -1,0 +1,81 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://triage-harness/schemas/evidence_bundle.json",
+  "title": "Evidence bundle",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["alert_key", "reachability", "advisory", "exploitability", "truncated"],
+  "properties": {
+    "alert_key": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+    "reachability": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["level", "scale", "confidence", "method"],
+      "properties": {
+        "level": { "type": "integer", "minimum": 0, "maximum": 5 },
+        "scale": {
+          "type": "object",
+          "additionalProperties": { "type": "string" }
+        },
+        "confidence": { "type": "number", "minimum": 0, "maximum": 1 },
+        "method": { "type": "string", "minLength": 1 },
+        "tool_version": { "type": "string" },
+        "error": { "type": ["string", "null"] }
+      }
+    },
+    "dependency_path": { "type": "array", "items": { "type": "string" } },
+    "call_sites": {
+      "type": "array",
+      "maxItems": 15,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["file", "line", "symbol"],
+        "properties": {
+          "file": { "type": "string" },
+          "line": { "type": "integer", "minimum": 0 },
+          "symbol": { "type": "string" },
+          "snippet": { "type": "string" },
+          "nearest_entry_point": { "type": ["string", "null"] },
+          "behind_auth": { "type": ["boolean", "null"] }
+        }
+      }
+    },
+    "advisory": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["ghsa_id", "summary", "affected_symbols"],
+      "properties": {
+        "ghsa_id": { "type": "string" },
+        "cve_id": { "type": ["string", "null"] },
+        "summary": { "type": "string" },
+        "affected_symbols": { "type": "array", "items": { "type": "string" } },
+        "symbols_known": { "type": "boolean" }
+      }
+    },
+    "exploitability": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "cvss": { "type": ["number", "null"] },
+        "epss": { "type": ["number", "null"] },
+        "in_kev": { "type": ["boolean", "null"] },
+        "severity": { "type": ["string", "null"] }
+      }
+    },
+    "package": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "purl": { "type": "string" },
+        "ecosystem": { "type": "string" },
+        "resolved_version": { "type": ["string", "null"] },
+        "patched_version": { "type": ["string", "null"] },
+        "manifest_path": { "type": "string" },
+        "dep_scope": { "type": ["string", "null"] },
+        "is_direct": { "type": ["boolean", "null"] }
+      }
+    },
+    "truncated": { "type": "boolean" }
+  }
+}

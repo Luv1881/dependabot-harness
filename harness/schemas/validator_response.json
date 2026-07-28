@@ -1,0 +1,26 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://triage-harness/schemas/validator_response.json",
+  "title": "Adversarial validator response",
+  "description": "The validator can only agree or object. It has no field in which to file a finding of its own, and additionalProperties is false so it cannot invent one.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["agrees", "strongest_objection", "cited_counter_evidence"],
+  "properties": {
+    "agrees": { "type": "boolean" },
+    "strongest_objection": { "type": "string" },
+    "cited_counter_evidence": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["file", "line", "why"],
+        "properties": {
+          "file": { "type": "string", "minLength": 1 },
+          "line": { "type": "integer", "minimum": 1 },
+          "why": { "type": "string", "minLength": 1 }
+        }
+      }
+    }
+  }
+}

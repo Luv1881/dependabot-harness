@@ -1,0 +1,95 @@
+# Deterministic policy rules (§6). Applied before any model is touched.
+# Each rule terminates the alert with a verdict and a machine-readable reason.
+# Engine lands in M2; this file is the data contract.
+#
+# outcome.kind: verdict | escalate | skip_analysis | dedup
+# Order is significant: first match wins.
+
+rules:
+  - id: already_fixed
+    description: Resolved version already >= patched version.
+    when:
+      resolved_ge_patched: true
+    outcome:
+      kind: verdict
+      verdict: fixed
+      vex_status: fixed
+      reason: resolved_version_at_or_above_patched
+
+  - id: superseded
+    description: A newer advisory for the same purl supersedes this one.
+    when:
+      superseded_by_newer_advisory: true
+    outcome:
+      kind: dedup
+      reason: superseded_by_newer_advisory
+
+  - id: kev_direct_critical
+    description: Known-exploited, direct dependency, critical CVSS. Escalate, skip analysis.
+    when:
+      in_kev: true
+      is_direct: true
+      cvss_min: 9.0
+    outcome:
+      kind: escalate
+      verdict: affected
+      vex_status: affected
+      reason: kev_direct_critical
+      needs_human: true
+
+  - id: dev_only
+    description: >
+      Development-scope dependency absent from every production build target.
+      Without a cached architecture, degrades to manifest-declared dev scope only;
+      the emitted reason records which variant fired.
+    when:
+      dep_scope: development
+      absent_from_prod_build_targets: true
+    outcome:
+      kind: verdict
+      verdict: not_affected
+      vex_status: not_affected
+      vex_justification: component_not_present
+      reason: dev_scope_not_in_production_build
+
+  - id: not_imported
+    description: Package name never appears in any import/require/use statement.
+    when:
+      package_never_imported: true
+    outcome:
+      kind: verdict
+      verdict: not_affected
+      vex_status: not_affected
+      vex_justification: vulnerable_code_not_present
+      reason: package_never_imported
+
+  - id: trivial_patch
+    description: Patched version is a patch-level bump, no major/minor change.
+    when:
+      patch_level_bump_only: true
+    outcome:
+      kind: skip_analysis
+      verdict: affected
+      vex_status: affected
+      reason: trivial_patch_bump_recommended
+
+severity_thresholds:
+  critical: 9.0
+  high: 7.0
+  medium: 4.0
+  low: 0.1
+
+# Reachability level at/above which a not_affected verdict is a contradiction (§7a).
+contradiction_reachability_level: 4
+
+# Advisory without ecosystem_specific.imports (§14.5).
+unknown_symbols_caps:
+  max_reachability_level: 2
+  max_confidence: 0.5
+
+valid_vex_justifications:
+  - component_not_present
+  - vulnerable_code_not_present
+  - vulnerable_code_not_in_execute_path
+  - vulnerable_code_cannot_be_controlled_by_adversary
+  - inline_mitigations_already_exist
