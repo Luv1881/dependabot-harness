@@ -116,6 +116,14 @@ two runs over different case sets cannot be compared into a false improvement.
 20% of the set is held out. `run_eval.py` will not score it without an explicit
 `--holdout` flag, and warns when it does.
 
+## Validated against real projects
+
+Run end to end against [prometheus/prometheus](https://github.com/prometheus/prometheus)
+(537 dependencies, 48 advisories, 68.75% cleared deterministically) and
+[apache/airflow](https://github.com/apache/airflow) — neither administered by the
+operator, both at $0.00 model spend. Six defects surfaced that no synthetic fixture had
+caught. Full results and the bug list: [`docs/validation.md`](docs/validation.md).
+
 ## Verified against real tooling
 
 Two accept gates were checked against the actual tools rather than mocks:
@@ -125,6 +133,8 @@ Two accept gates were checked against the actual tools rather than mocks:
 - **Emit** — a real `grype` run consumed a VEX document produced by this harness and
   suppressed exactly the finding marked `not_affected`, leaving the other three reported.
   Fixtures: `tests/fixtures/grype_*.json`.
+- **CVSS** — differential-tested against the `cvss` reference library across all 3,888
+  vectors in the v3.1 base metric space, rather than against remembered constants.
 
 ## Development
 

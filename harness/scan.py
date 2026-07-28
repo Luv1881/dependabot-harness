@@ -44,12 +44,18 @@ class ScanResult:
     stages: dict[str, Any] = field(default_factory=dict)
     spend_usd: float = 0.0
 
+    @property
+    def coverage_complete(self) -> bool:
+        """False when some dependencies were never checked against the advisory database."""
+        return bool(self.discovery.get("coverage_complete", False))
+
     def to_dict(self) -> dict[str, Any]:
         return {
             "repo": self.repo,
             "run_id": self.run_id,
             "commit_sha": self.commit_sha,
             "agents_enabled": self.agents_enabled,
+            "coverage_complete": self.coverage_complete,
             "discovery": self.discovery,
             "stages": self.stages,
             "spend_usd": round(self.spend_usd, 6),

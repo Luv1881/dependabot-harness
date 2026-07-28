@@ -133,6 +133,12 @@ def cmd_scan_public(args: argparse.Namespace) -> int:
         discovery.get("unpinned_skipped", 0),
         discovery.get("advisories", 0),
     )
+    if not result.coverage_complete:
+        log.warning(
+            "coverage is INCOMPLETE: %d dependencies were never checked. "
+            "Absence of findings for those is not evidence they are clean.",
+            discovery.get("unqueried", 0),
+        )
     if not result.agents_enabled:
         log.info("agent stages skipped: ANTHROPIC_API_KEY is not set")
     return 0

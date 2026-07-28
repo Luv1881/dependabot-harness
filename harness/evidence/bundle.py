@@ -50,6 +50,11 @@ class EvidenceBundle:
     def toolchain_failed(self) -> bool:
         return bool(self.reachability["method"] == "failed")
 
+    @property
+    def symbols_known(self) -> bool:
+        """Whether the advisory named symbols the tooling could search for."""
+        return bool(self.advisory.get("symbols_known"))
+
     def to_dict(self) -> dict[str, Any]:
         return {
             "alert_key": self.alert_key,
@@ -139,14 +144,28 @@ class EvidenceBuilder:
 
 
 def is_shallow(bundles: list[EvidenceBundle]) -> bool:
-    """A repo whose evidence produced zero call sites across every alert.
+    """A repo whose evidence produced nothing because the toolchain is broken.
 
-    That is a broken toolchain, not a secure repo, so the caller requeues rather than
-    trusting the emptiness.
+    Three things rule it out, in order. Any call site anywhere means the tooling
+    demonstrably worked, whatever the levels came out at. Failing that, advisories with
+    no symbol data leave nothing to search for, and the unknown-symbols cap holds every
+    level at 2 by design. Only when the tooling ran, had symbols to look for, and still
+    found nothing at all is the emptiness suspicious.
+
+    Getting this wrong in either direction is costly: too eager and healthy repositories
+    requeue forever, too lax and a silently broken toolchain reads as a clean bill.
     """
     if not bundles:
         return False
     if all(b.toolchain_failed for b in bundles):
         return True
-    reached = any(b.level >= ReachabilityLevel.SYMBOL_REFERENCED for b in bundles)
-    return not reached and not any(b.call_sites for b in bundles)
+
+    ran = [b for b in bundles if not b.toolchain_failed]
+    if any(b.call_sites for b in ran):
+        return False
+
+    measurable = [b for b in ran if b.symbols_known]
+    if not measurable:
+        return False
+
+    return not any(b.level >= ReachabilityLevel.SYMBOL_REFERENCED for b in measurable)

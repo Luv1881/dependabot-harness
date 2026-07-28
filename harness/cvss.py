@@ -86,8 +86,14 @@ def severity_label(score: float) -> str:
 
 
 def _round_up(value: float) -> float:
-    """CVSS rounds up to one decimal place, which ordinary rounding does not do."""
-    scaled = int(value * 100000)
+    """The CVSS v3.1 `Roundup` function, which ceilings to one decimal place.
+
+    This is not round-half-up: v3.1 Appendix A deliberately changed it so that a score
+    of 7.14 becomes 7.2, and an implementation that rounds half-up disagrees with the
+    published vectors. Verified against the `cvss` reference library over the full
+    metric space in the tests.
+    """
+    scaled = round(value * 100000)
     if scaled % 10000 == 0:
         return scaled / 100000.0
     return (scaled // 10000 + 1) / 10.0

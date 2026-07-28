@@ -24,6 +24,7 @@ from ..cvss import parse_vector
 from ..ecosystems import get_adapter
 from ..ecosystems.base import Dependency
 from ..util import retry_with_backoff
+from ..versions import Version, try_parse
 from .github import GithubClient, RawAlert
 from .osv import OsvClient
 
@@ -65,8 +66,19 @@ class ScanStats:
     dependencies: int = 0
     unpinned_skipped: int = 0
     queried: int = 0
+    unqueried: int = 0
     advisories: int = 0
     errors: list[str] = field(default_factory=list)
+
+    @property
+    def coverage_complete(self) -> bool:
+        """Whether every pinned dependency was actually checked against OSV.
+
+        A batch that failed leaves its dependencies unexamined. Reporting the scan as
+        clean would turn an outage into an all-clear, so the caller is told the coverage
+        is partial and which dependencies were never looked at.
+        """
+        return self.unqueried == 0 and not self.errors
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -74,7 +86,9 @@ class ScanStats:
             "dependencies": self.dependencies,
             "unpinned_skipped": self.unpinned_skipped,
             "queried": self.queried,
+            "unqueried": self.unqueried,
             "advisories": self.advisories,
+            "coverage_complete": self.coverage_complete,
             "errors": self.errors,
         }
 
@@ -147,7 +161,6 @@ class OsvAlertSource:
                 }
                 for item in chunk
             ]
-            self.stats.queried += len(queries)
 
             def once(queries: list[dict[str, Any]] = queries) -> httpx.Response:
                 return self._client.post(OSV_BATCH_URL, json={"queries": queries})
@@ -155,17 +168,27 @@ class OsvAlertSource:
             try:
                 response = retry_with_backoff(once, retry_on=(httpx.TransportError,))
             except Exception as exc:
-                self.stats.errors.append(f"OSV batch query failed: {exc}")
+                self._record_gap(chunk, f"OSV batch query failed: {exc}")
                 continue
             if response.status_code >= 400:
-                self.stats.errors.append(f"OSV batch query: HTTP {response.status_code}")
+                self._record_gap(chunk, f"OSV batch query: HTTP {response.status_code}")
                 continue
+
+            self.stats.queried += len(queries)
 
             for item, result in zip(chunk, response.json().get("results") or [], strict=False):
                 ids = [str(v["id"]) for v in result.get("vulns") or [] if v.get("id")]
                 if ids:
                     out.append((item, ids))
         return out
+
+    def _record_gap(self, chunk: list[DiscoveredDependency], reason: str) -> None:
+        """Mark a batch as unexamined rather than letting it look advisory-free."""
+        self.stats.unqueried += len(chunk)
+        self.stats.errors.append(
+            f"{reason}; {len(chunk)} dependencies were not checked and their status is unknown"
+        )
+        log.warning("%s: coverage is incomplete", reason)
 
     def _advisory(self, vuln_id: str) -> Any:
         try:
@@ -226,7 +249,9 @@ def _to_raw_alert(repo: str, found: DiscoveredDependency, advisory: Any, number:
         cve_id=advisory.cve_id,
         package_name=found.dependency.name,
         ecosystem=found.ecosystem,
-        patched_version=_first_patched(advisory.raw, found.dependency.name),
+        patched_version=_patched_version(
+            advisory.raw, found.dependency.name, found.dependency.version
+        ),
         vulnerable_range=None,
         severity=severity,
         cvss_score=score,
@@ -256,13 +281,41 @@ def _severity(raw: dict[str, Any]) -> tuple[str | None, float | None, str | None
     return (label if label in _KNOWN_SEVERITIES else None, None, None)
 
 
-def _first_patched(raw: dict[str, Any], package: str) -> str | None:
-    """The first `fixed` event OSV records for this package."""
+def _patched_version(raw: dict[str, Any], package: str, installed: str) -> str | None:
+    """The fix for the branch the installed version is actually on.
+
+    An advisory routinely carries several ranges - fixed in 1.9.0 on the 1.x line and
+    2.3.0 on the 2.x line. Returning whichever appears first would hand the `already_fixed`
+    and `trivial_patch` rules a threshold from the wrong branch, and a 2.1.0 install would
+    be told it is fixed by 1.9.0.
+    """
+    current = try_parse(installed)
+    candidates: list[tuple[Version, str]] = []
+
     for affected in raw.get("affected") or []:
         if (affected.get("package") or {}).get("name") != package:
             continue
-        for ranges in affected.get("ranges") or []:
-            for event in ranges.get("events") or []:
-                if event.get("fixed"):
-                    return str(event["fixed"])
-    return None
+        for block in affected.get("ranges") or []:
+            introduced: Version | None = None
+            for event in block.get("events") or []:
+                if "introduced" in event:
+                    introduced = try_parse(str(event["introduced"]))
+                fixed_raw = event.get("fixed")
+                if not fixed_raw:
+                    continue
+                fixed = try_parse(str(fixed_raw))
+                if fixed is None:
+                    continue
+                if current is not None and introduced is not None and introduced <= current < fixed:
+                    return str(fixed_raw)
+                candidates.append((fixed, str(fixed_raw)))
+
+    if not candidates:
+        return None
+    if current is None:
+        return min(candidates, key=lambda pair: pair[0])[1]
+
+    above = [pair for pair in candidates if pair[0] > current]
+    if not above:
+        return None
+    return min(above, key=lambda pair: pair[0])[1]

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from typing import Any
+from typing import Any, ClassVar
 
 import httpx
 import pytest
@@ -188,3 +188,80 @@ class TestProtocolCompliance:
 
         src = OsvAlertSource(StubGithub(), tmp_path)  # type: ignore[arg-type]
         assert isinstance(src, AlertSource)
+
+
+class TestIncompleteCoverageIsNotAnAllClear:
+    """An outage must never read as 'this repository has no vulnerabilities'."""
+
+    def test_a_failed_batch_marks_coverage_incomplete(self, tmp_path: Path) -> None:
+        write(tmp_path, "go.mod", "require github.com/a/b v1.2.3\n")
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(503, text="Service Unavailable")
+
+        src = source_with(tmp_path, handler, advisory())
+        assert list(src.iter_alerts("org/repo")) == []
+        assert src.stats.coverage_complete is False
+        assert src.stats.unqueried == 1
+        assert "status is unknown" in src.stats.errors[0]
+
+    def test_a_successful_scan_reports_complete_coverage(self, tmp_path: Path) -> None:
+        write(tmp_path, "go.mod", "require github.com/a/b v1.2.3\n")
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(200, json={"results": [{}]})
+
+        src = source_with(tmp_path, handler, advisory())
+        list(src.iter_alerts("org/repo"))
+        assert src.stats.coverage_complete is True
+        assert src.stats.unqueried == 0
+
+    def test_unqueried_dependencies_are_not_counted_as_queried(self, tmp_path: Path) -> None:
+        write(tmp_path, "go.mod", "require github.com/a/b v1.2.3\n")
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(500, text="boom")
+
+        src = source_with(tmp_path, handler, advisory())
+        list(src.iter_alerts("org/repo"))
+        assert src.stats.queried == 0
+
+
+class TestPatchedVersionPicksTheRightBranch:
+    RAW: ClassVar = {
+        "affected": [
+            {
+                "package": {"name": "p"},
+                "ranges": [
+                    {"events": [{"introduced": "1.0.0"}, {"fixed": "1.9.0"}]},
+                    {"events": [{"introduced": "2.0.0"}, {"fixed": "2.3.0"}]},
+                ],
+            }
+        ]
+    }
+
+    def test_first_branch(self) -> None:
+        from harness.sources.osv_scan import _patched_version
+
+        assert _patched_version(self.RAW, "p", "1.4.2") == "1.9.0"
+
+    def test_second_branch_is_not_given_the_first_branch_fix(self) -> None:
+        from harness.sources.osv_scan import _patched_version
+
+        assert _patched_version(self.RAW, "p", "2.1.0") == "2.3.0"
+
+    def test_a_version_above_every_fix_has_nothing_to_upgrade_to(self) -> None:
+        """Returning a lower fix would let `already_fixed` fire on the wrong branch."""
+        from harness.sources.osv_scan import _patched_version
+
+        assert _patched_version(self.RAW, "p", "3.0.0") is None
+
+    def test_unparsable_installed_version_falls_back_to_the_lowest_fix(self) -> None:
+        from harness.sources.osv_scan import _patched_version
+
+        assert _patched_version(self.RAW, "p", "not-a-version") == "1.9.0"
+
+    def test_other_packages_are_ignored(self) -> None:
+        from harness.sources.osv_scan import _patched_version
+
+        assert _patched_version(self.RAW, "other", "1.0.0") is None

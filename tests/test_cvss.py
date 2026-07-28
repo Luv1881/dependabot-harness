@@ -1,27 +1,59 @@
 from __future__ import annotations
 
+from typing import ClassVar
+
 import pytest
 
 from harness.cvss import parse_vector, severity_label
 
 
-class TestPublishedReferenceVectors:
-    """Scores checked against the published CVSS v3.1 examples."""
+class TestAgainstTheReferenceImplementation:
+    """Differential test against the `cvss` library over the whole metric space.
 
-    @pytest.mark.parametrize(
-        ("vector", "expected"),
-        [
-            ("CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H", 9.8),
-            ("CVSS:3.1/AV:N/AC:H/PR:N/UI:N/S:U/C:N/I:N/A:H", 5.9),
-            ("CVSS:3.1/AV:L/AC:L/PR:L/UI:N/S:U/C:H/I:N/A:N", 5.5),
-            ("CVSS:3.1/AV:N/AC:L/PR:N/UI:R/S:C/C:L/I:L/A:N", 6.1),
-            ("CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:N/I:N/A:N", 0.0),
-        ],
-    )
-    def test_base_score(self, vector: str, expected: float) -> None:
-        result = parse_vector(vector)
-        assert result is not None
-        assert result.base == pytest.approx(expected)
+    Hand-copied expected scores are the thing most likely to be wrong here, so the
+    oracle is an independent implementation rather than a table of remembered constants.
+    """
+
+    METRICS: ClassVar = {
+        "AV": "NALP",
+        "AC": "LH",
+        "PR": "NLH",
+        "UI": "NR",
+        "S": "UC",
+        "C": "HLN",
+        "I": "HLN",
+        "A": "HLN",
+    }
+
+    def all_vectors(self) -> list[str]:
+        from itertools import product
+
+        keys = list(self.METRICS)
+        return [
+            "CVSS:3.1/" + "/".join(f"{k}:{v}" for k, v in zip(keys, combo, strict=True))
+            for combo in product(*self.METRICS.values())
+        ]
+
+    def test_every_vector_in_the_metric_space_matches(self) -> None:
+        cvss_lib = pytest.importorskip("cvss")
+
+        vectors = self.all_vectors()
+        assert len(vectors) == 4 * 2 * 3 * 2 * 2 * 3 * 3 * 3
+
+        mismatches = [
+            v
+            for v in vectors
+            if abs(float(cvss_lib.CVSS3(v).base_score) - parse_vector(v).base) > 1e-9
+        ]
+        assert mismatches == []
+
+    def test_roundup_ceilings_rather_than_rounding_half_up(self) -> None:
+        """CVSS v3.1 Appendix A changed this from v3.0; half-up disagrees with the spec."""
+        from harness.cvss import _round_up
+
+        assert _round_up(7.14) == 7.2
+        assert _round_up(7.10) == 7.1
+        assert _round_up(0.0) == 0.0
 
     def test_v30_vectors_are_accepted(self) -> None:
         result = parse_vector("CVSS:3.0/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H")

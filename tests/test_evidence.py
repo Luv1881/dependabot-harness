@@ -391,3 +391,74 @@ class TestShallowRequeuePreservesDiagnostics:
             assert "no checkout available" in row["error"]
             payload = db.stage_payload("r1", record.alert_key, "evidence")
             assert payload["reachability"]["method"] == "failed"
+
+
+class TestShallowDistinguishesCauses:
+    """A repo is shallow when the toolchain is broken, not when advisories lack symbols."""
+
+    def build(self, **kw: Any):
+        from harness.ecosystems.base import ReachabilityResult
+
+        level = kw.pop("level", ReachabilityLevel.IMPORTED)
+        symbols = kw.pop("symbols", ["pkg.Sym"])
+        raw = ReachabilityResult(level, 0.9, kw.pop("method", "govulncheck"))
+        return EvidenceBuilder(GoAdapter()).build(alert(symbols=symbols), raw)
+
+    def test_advisories_without_symbols_are_not_a_broken_toolchain(self) -> None:
+        bundles = [self.build(symbols=None) for _ in range(3)]
+        assert all(b.reachability["method"] != "failed" for b in bundles)
+        assert is_shallow(bundles) is False
+
+    def test_a_toolchain_that_found_nothing_with_symbols_to_find_is_shallow(self) -> None:
+        bundles = [self.build(symbols=["pkg.Sym"], level=ReachabilityLevel.PRESENT)]
+        assert is_shallow(bundles) is True
+
+    def test_a_mix_is_judged_on_the_measurable_ones(self) -> None:
+        bundles = [
+            self.build(symbols=None),
+            self.build(symbols=["pkg.Sym"], level=ReachabilityLevel.PATH_FROM_ENTRY),
+        ]
+        assert is_shallow(bundles) is False
+
+    def test_all_toolchain_failures_are_still_shallow(self) -> None:
+        from harness.ecosystems.base import ReachabilityResult
+
+        bundles = [
+            EvidenceBuilder(GoAdapter()).build(
+                alert(), ReachabilityResult.failed("govulncheck", "not installed")
+            )
+        ]
+        assert is_shallow(bundles) is True
+
+
+class TestShallowCountsCallSitesFromEveryBundle:
+    def test_call_sites_rule_out_shallow_even_when_the_level_was_capped(self) -> None:
+        """A capped level with real call frames is a measurement, not an empty scan."""
+        from harness.ecosystems.base import ReachabilityResult
+
+        capped = EvidenceBuilder(GoAdapter()).build(
+            alert(symbols=None),
+            ReachabilityResult(
+                ReachabilityLevel.PATH_FROM_ENTRY,
+                0.95,
+                "govulncheck",
+                call_sites=[CallSite(file="a.go", line=1, symbol="X")],
+            ),
+        )
+        unreached = EvidenceBuilder(GoAdapter()).build(
+            alert(symbols=["pkg.Sym"]),
+            ReachabilityResult(ReachabilityLevel.PRESENT, 0.9, "govulncheck"),
+        )
+        assert capped.level == int(ReachabilityLevel.IMPORTED)
+        assert is_shallow([capped, unreached]) is False
+
+    def test_no_call_sites_anywhere_with_symbols_present_is_shallow(self) -> None:
+        from harness.ecosystems.base import ReachabilityResult
+
+        bundles = [
+            EvidenceBuilder(GoAdapter()).build(
+                alert(symbols=["pkg.Sym"]),
+                ReachabilityResult(ReachabilityLevel.PRESENT, 0.9, "govulncheck"),
+            )
+        ]
+        assert is_shallow(bundles) is True
