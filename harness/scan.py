@@ -132,7 +132,11 @@ def scan_public_repo(
                     ValidationStage(scoped, db, ledger, checkouts=checkouts).run(run_id).to_dict()
                 )
 
-            result.stages["emit"] = EmitStage(scoped, db, github=None).run(run_id).to_dict()
+            result.stages["emit"] = (
+                EmitStage(scoped, db, github=None, coverage_complete=source.stats.coverage_complete)
+                .run(run_id)
+                .to_dict()
+            )
             db.finish_run(run_id, "complete")
         except BaseException:
             db.finish_run(run_id, "aborted")

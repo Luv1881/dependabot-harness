@@ -511,3 +511,34 @@ class TestCommentConfidenceFormatting:
         head = {"k1": {**AFFECTED, "purl": "pkg:x", "confidence": True}}
         body = comment.render(comment.diff_verdicts({}, head), repo="r")
         assert "100% confidence" not in body
+
+
+class TestIncompleteCoverageBlocksDismissal:
+    """A partial scan does not know what it missed, so it dismisses nothing."""
+
+    def gate(self, *, complete: bool) -> DismissalGate:
+        return DismissalGate(
+            enabled=True,
+            requirements={
+                "verdict": "not_affected",
+                "confidence_min": 0.85,
+                "validator_agreed": True,
+            },
+            coverage_complete=complete,
+        )
+
+    def test_complete_coverage_allows_an_otherwise_valid_dismissal(self) -> None:
+        assert self.gate(complete=True).evaluate(NOT_AFFECTED, True).allowed
+
+    def test_incomplete_coverage_blocks_it(self) -> None:
+        decision = self.gate(complete=False).evaluate(NOT_AFFECTED, True)
+        assert not decision.allowed
+        assert "coverage" in decision.blocked_by
+
+    def test_the_stage_honours_the_flag(self, cfg: HarnessConfig) -> None:
+        github = FakeGithub()
+        with Database(cfg.storage.db_path) as db:
+            seed(db, NOT_AFFECTED, validated=True)
+            report = EmitStage(cfg, db, github=github, coverage_complete=False).run("run1")
+            assert report.dismissed == 0
+            assert github.dismissals == []

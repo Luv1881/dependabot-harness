@@ -174,9 +174,16 @@ class OsvAlertSource:
                 self._record_gap(chunk, f"OSV batch query: HTTP {response.status_code}")
                 continue
 
-            self.stats.queried += len(queries)
+            results = response.json().get("results") or []
+            if len(results) != len(chunk):
+                self._record_gap(
+                    chunk,
+                    f"OSV returned {len(results)} results for {len(chunk)} queries",
+                )
+                continue
 
-            for item, result in zip(chunk, response.json().get("results") or [], strict=False):
+            self.stats.queried += len(queries)
+            for item, result in zip(chunk, results, strict=True):
                 ids = [str(v["id"]) for v in result.get("vulns") or [] if v.get("id")]
                 if ids:
                     out.append((item, ids))

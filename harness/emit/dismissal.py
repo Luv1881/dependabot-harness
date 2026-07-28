@@ -31,6 +31,13 @@ class DismissalGate:
 
     enabled: bool
     requirements: dict[str, Any] = field(default_factory=dict)
+    coverage_complete: bool = True
+    """Whether every dependency was actually checked against the advisory database.
+
+    A scan that could not reach OSV for part of the tree does not know what it missed,
+    so nothing from that scan is dismissed. Closing an alert on the strength of a partial
+    scan is the same mistake as closing one on a failed toolchain.
+    """
 
     def evaluate(self, verdict: dict[str, Any], validated: bool | None) -> GateDecision:
         """Fail closed.
@@ -41,6 +48,12 @@ class DismissalGate:
         """
         if not self.enabled:
             return GateDecision(False, ("auto_dismiss is disabled",))
+
+        if not self.coverage_complete:
+            return GateDecision(
+                False,
+                ("advisory coverage for this scan is incomplete; nothing is dismissed",),
+            )
 
         missing = [k for k in REQUIRED_GATE_KEYS if k not in self.requirements]
         if missing:

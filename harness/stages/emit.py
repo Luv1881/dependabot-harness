@@ -59,6 +59,7 @@ class EmitStage:
         db: Database,
         *,
         github: AlertDismisser | None = None,
+        coverage_complete: bool = True,
     ) -> None:
         self.cfg = cfg
         self.db = db
@@ -66,6 +67,7 @@ class EmitStage:
         self.gate = DismissalGate(
             enabled=cfg.output.auto_dismiss,
             requirements=dict(cfg.output.auto_dismiss_requires),
+            coverage_complete=coverage_complete,
         )
 
     def run(self, run_id: str) -> EmitReport:

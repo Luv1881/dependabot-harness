@@ -265,3 +265,28 @@ class TestPatchedVersionPicksTheRightBranch:
         from harness.sources.osv_scan import _patched_version
 
         assert _patched_version(self.RAW, "other", "1.0.0") is None
+
+
+class TestTruncatedOsvResponse:
+    def test_fewer_results_than_queries_is_a_gap_not_a_clean_bill(self, tmp_path: Path) -> None:
+        """A short response would otherwise drop dependencies silently."""
+        write(tmp_path, "go.mod", "require github.com/a/b v1.2.3\nrequire github.com/c/d v2.0.0\n")
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(200, json={"results": [{}]})
+
+        src = source_with(tmp_path, handler, advisory())
+        assert list(src.iter_alerts("org/repo")) == []
+        assert src.stats.coverage_complete is False
+        assert src.stats.queried == 0
+        assert "returned 1 results for 2 queries" in src.stats.errors[0]
+
+    def test_a_matching_response_length_is_accepted(self, tmp_path: Path) -> None:
+        write(tmp_path, "go.mod", "require github.com/a/b v1.2.3\n")
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(200, json={"results": [{}]})
+
+        src = source_with(tmp_path, handler, advisory())
+        list(src.iter_alerts("org/repo"))
+        assert src.stats.coverage_complete is True
