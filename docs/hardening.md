@@ -1,8 +1,9 @@
 # Security hardening
 
-A full audit of the harness against its own threat model, run after M10. Every finding
-below is fixed and pinned by a test; the test names are given so a regression is caught
-rather than re-discovered.
+A full audit of the harness against its own threat model. Every finding below is fixed and
+pinned by a test; the test names are given so a regression is caught rather than
+re-discovered. The first round is a review of the code. The second is what running it
+against real repositories on a real provider turned up, which the review had not.
 
 ## Threat model
 
@@ -258,6 +259,113 @@ mistaken for a passing one.
 
 `harness models` exists for the same reason: a tier name is marketing and the identifier
 is what the API accepts, so the provider is asked directly rather than guessed at.
+
+## Round two — found by running it
+
+Everything below surfaced from actually executing the pipeline against real repositories on a
+real provider, not from reading it. Each was invisible to the test suite, and each is now
+pinned by a test that would have caught it.
+
+### 14. `--agents off` demanded a model credential — high
+
+The documented free path. `DedupStage.__init__` built its `ModelClient` regardless of
+`use_agent`, so with a config naming a provider that requires a key, even the fully
+deterministic scan exited 3 asking for one it would never use. A stage that is switched off
+must not construct the thing it is switched off from.
+`tests/test_dedup.py::TestDisabledAgentStageNeedsNoCredential`
+
+### 15. npm `lockfileVersion: 1` produced zero dependencies and complete coverage — high
+
+`NpmAdapter.parse_dependencies` read only the modern flat `packages` map. Version 1
+lockfiles — npm 6 and earlier, and plenty of repositories still — nest dependencies by
+install path, so the parse silently returned nothing. The scan then reported **no
+dependencies, no advisories, `coverage_complete: true`** over a lockfile holding a
+known-vulnerable `lodash`. Found by scanning `dependabot/demo`, and the worst kind of
+defect this audit turned up: a false all-clear, produced quietly.
+
+Fixed by reading both shapes, deduplicating on `(name, version)` so multiple legitimate
+versions of one package survive, and refusing a file that parses as JSON but matches
+neither shape rather than calling it empty.
+`tests/test_ecosystems.py::TestNpmLockfileShapes`,
+`tests/test_osv_scan.py::TestDiscovery::test_a_v1_lockfile_now_yields_its_dependencies`
+
+### 16. An unpriced model silently disarmed every budget cap — high
+
+`price()` returns `0.0` for a model outside its table, so the ledger summed zeros and
+`BudgetLedger.check` could never observe a threshold. `is_priced()` existed and was never
+called. A run of 36 paid DeepSeek calls reported `spend_usd: $0.000000` — "unknown"
+recorded as "free", which is the exact confusion the rest of the system refuses to make.
+
+Fixed three ways: rates can be declared per role (`models.<role>.pricing`), a half-declared
+price is refused at startup, and every call is ledgered with a `priced` flag so the run
+reports `unpriced_calls` and `spend_is_complete: false` rather than a confident zero.
+Startup warns by name when a configured model has no rates.
+`tests/test_models.py::TestPricingIsNotOptional`
+
+### 17. The OpenAI-compatible path could not carry tools, and mis-read truncation — high
+
+Two independent defects, both found by pointing the harness at DeepSeek:
+
+- `finish_reason` was passed through untranslated. OpenAI-shaped vendors report `length`
+  for a truncated completion; `classify` reads `max_tokens`. The truncated-and-retried path
+  therefore never fired on these providers and a clipped response was classified complete.
+- `request.tools` was ignored entirely and history was forwarded in Anthropic content-block
+  form, so the judgment agent received **no tool surface at all** and ran blind on every
+  OpenAI-compatible provider.
+
+Fixed by translating the stop-reason vocabulary at the provider boundary, translating tool
+declarations and the tool round-trip into OpenAI's wire format, and parsing tool calls back
+into the neutral block shape so the agent loop is unchanged. Verified live: the model drove
+`grep` through the real toolbox, and the audit trail recorded each call.
+`tests/test_models.py::TestOpenAiStopReasonVocabulary`, `::TestToolCallTranslation`
+
+### 18. An empty `.env` value was refused as an unbalanced quote — low
+
+`value[:1] in "\"'"` — an empty slice is a substring of every string, so `A=` raised.
+Found by a test written for the feature itself.
+`tests/test_env_file.py::TestParsing::test_values_are_unwrapped`
+
+## Additions
+
+**`scan-local`.** `scan-public` fetches from GitHub, which needs a credential and a network.
+A private mirror, an air-gapped runner, a reviewer checking a colleague's branch, and the
+harness's own end-to-end tests all have the code locally already. It reads the tree, derives
+`structure_hash` with the same invalidation semantics as the API-backed version, refuses to
+evict the operator's directory, and needs no GitHub credential. `tests/test_scan_local.py`
+
+**`--env-file`.** The shell incantation for exporting a dotenv file is not portable; under
+fish `set -a; . ./.env; set +a` is three separate errors. The file is now read directly,
+explicitly, and never implicitly — existing environment variables win, and a missing
+variable that a `./.env` defines produces a hint naming the flag. `tests/test_env_file.py`
+
+**`harness models`.** A tier name is marketing and the identifier is what the API accepts.
+This asks the provider's own listing endpoint (no SDK, no GitHub token) and reports a
+rejected key as a rejected key rather than as an empty catalogue. It immediately resolved
+`deepseek-flash`, which no amount of reading the source would have revealed.
+`tests/test_catalogue.py`
+
+## End-to-end runs against real repositories
+
+All three at $0.00 model spend unless noted.
+
+| Repository | Dependencies | Advisories | Cleared by rules | Outcome |
+|---|---:|---:|---:|---|
+| `dependabot/demo` (npm **v1** lockfile) | 6 | 6 | 100% | 3 statements, 3 dismissals blocked |
+| `snyk-labs/nodejs-goof` (npm v2) | 980 | **293** | 91.1% | 18 evidence failures, repo `shallow`, 135 dismissals blocked |
+| `apache/airflow` (Python, 306 MB tree) | 102 | 27 | 58.8% | 5 judged on `deepseek-flash`, 2 mechanically rejected, 13 dismissals blocked |
+
+Airflow was also run with the agent stages **on** for 36 DeepSeek calls. Three things worth
+recording:
+
+- `validation` reported `mechanically_rejected: 2` — the deterministic checks rejected two of
+  the model's verdicts before any reviewer saw them. That layer earning its keep on real
+  output is the point of having it.
+- Every verdict came back `validated: NULL`, and **all 13 dismissals were blocked** because no
+  validator is configured. A single-model deployment cannot close an alert, by design.
+- `snyk-labs/nodejs-goof` demonstrates the central invariant at scale: npm reachability is not
+  implemented, so all 18 measurements are `method: failed, confidence: 0.0, level: 0` — a
+  failure, never a low reachability — the repo is flagged `shallow`, and nothing is dismissed.
+  "We could not tell" survived contact with 293 real advisories.
 
 ## Gating
 

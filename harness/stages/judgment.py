@@ -21,7 +21,7 @@ from ..db import AlertRecord, Database
 from ..models import BudgetLedger, ModelClient, ModelError, ModelRequest
 from ..models.client import ContextCeilingExceeded
 from ..schemas import SchemaViolation, validate
-from ..sources.checkout import CheckoutError, CheckoutManager
+from ..sources.checkout import CheckoutError, CheckoutManager, CheckoutProvider
 from ..sources.osv import OsvClient
 from ..util import RetryExhausted, canonical_json
 
@@ -93,7 +93,7 @@ class JudgmentStage:
         ledger: BudgetLedger,
         *,
         client: ModelClient | None = None,
-        checkouts: CheckoutManager | None = None,
+        checkouts: CheckoutProvider | None = None,
         osv: OsvClient | None = None,
     ) -> None:
         self.cfg = cfg

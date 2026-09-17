@@ -173,6 +173,17 @@ class ReachabilityResult:
         return self.method == "failed"
 
 
+class UnparsableManifest(ValueError):
+    """The file is the format the adapter handles, but not a structure it recognises.
+
+    Raised instead of returning an empty dependency list, because "this manifest declares
+    nothing" and "I do not understand this file" are different answers and only one of
+    them is safe. An unparsable lockfile that returns nothing is counted as a repository
+    with no dependencies, keeps ``coverage_complete`` true, and therefore reports as
+    clean — over a file full of vulnerable packages.
+    """
+
+
 class EcosystemAdapter(ABC):
     """One per package ecosystem. Runs the real SCA tooling; the agent never does."""
 

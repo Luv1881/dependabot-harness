@@ -10,22 +10,26 @@ import argparse
 import json
 import logging
 import os
+import re
 import sys
 import uuid
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 from .config import ConfigError, HarnessConfig, load_config, load_policy, valid_repo
 from .db import Database
+from .env_file import EnvFileError, load_env_file, names_defined_in
 from .models import (
     BudgetLedger,
     CatalogueError,
     ProviderConfigurationError,
+    is_priced,
     list_models,
     required_api_key_env,
 )
 from .policy import PolicyEngine
-from .scan import scan_public_repo
+from .scan import scan_local_repo, scan_public_repo
 from .sources.github import GithubClient
 from .stages.dedup import DedupReport, DedupStage, propagate_verdicts
 from .stages.emit import EmitReport, EmitStage
@@ -37,6 +41,30 @@ from .stages.recon import ReconReport, ReconStage
 from .stages.validate import ValidationReport, ValidationStage
 
 log = logging.getLogger("harness")
+
+DEFAULT_ENV_FILE = Path(".env")
+
+
+def _with_env_hint(message: str) -> str:
+    """Point at a ``.env`` that already defines the variable the error is complaining about.
+
+    The harness never loads ``.env`` on its own, and should not start: implicit secret
+    loading is how a stray file in a working directory changes what a run does. But when a
+    required variable is missing and a file sitting right there defines it, saying so is
+    the difference between a one-line fix and a hunt through the README.
+    """
+    if not DEFAULT_ENV_FILE.is_file():
+        return message
+    names = names_defined_in(DEFAULT_ENV_FILE)
+    mentioned = sorted(
+        name for name in names if re.search(rf"\b{re.escape(name)}\b", message)
+    )
+    if not mentioned:
+        return message
+    return (
+        f"{message.rstrip('.')}. {DEFAULT_ENV_FILE} defines {', '.join(mentioned)}; "
+        f"re-run with --env-file {DEFAULT_ENV_FILE}."
+    )
 
 
 def _setup_logging(verbose: bool) -> None:
@@ -70,6 +98,21 @@ def preflight_model_credentials(cfg: HarnessConfig) -> None:
             + "; ".join(missing)
             + ". Export the named variable(s) and re-run; the eval and scan-public paths "
             "run without them."
+        )
+
+    unpriced = sorted(
+        {
+            model.model
+            for model in cfg.models.values()
+            if not is_priced(model.model, model.pricing)
+        }
+    )
+    if unpriced:
+        log.warning(
+            "no rates declared for %s: those calls are ledgered at an unknown cost, so the "
+            "USD budget caps cannot be enforced. Declare models.<role>.pricing with "
+            "input_per_mtok and output_per_mtok to enable them.",
+            ", ".join(unpriced),
         )
 
 
@@ -143,6 +186,44 @@ def cmd_resume(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_scan_local(args: argparse.Namespace) -> int:
+    """Triage a working tree already on disk. No GitHub credential, no clone."""
+    cfg = load_config(args.config, require_github_auth=False)
+    run_id = args.run_id or _new_run_id()
+    use_agents = None if args.agents == "auto" else args.agents == "on"
+    if use_agents:
+        preflight_model_credentials(cfg)
+    result = scan_local_repo(
+        cfg,
+        args.path,
+        run_id,
+        policy_path=args.policy,
+        use_agents=use_agents,
+    )
+    print(json.dumps(result.to_dict(), indent=2))
+    _report_discovery(result)
+    return 0
+
+
+def _report_discovery(result: Any) -> None:
+    discovery = result.discovery
+    log.info(
+        "discovery: %d manifests, %d dependencies (%d unpinned skipped), %d advisories",
+        discovery.get("manifests", 0),
+        discovery.get("dependencies", 0),
+        discovery.get("unpinned_skipped", 0),
+        discovery.get("advisories", 0),
+    )
+    if not result.coverage_complete:
+        log.warning(
+            "coverage is INCOMPLETE: %d dependencies were never checked. "
+            "Absence of findings for those is not evidence they are clean.",
+            discovery.get("unqueried", 0),
+        )
+    if not result.agents_enabled:
+        log.info("agent stages skipped: no model API key is set in the environment")
+
+
 def cmd_scan_public(args: argparse.Namespace) -> int:
     """Triage a repository the harness does not administer, via OSV."""
     cfg = load_config(args.config)
@@ -163,23 +244,7 @@ def cmd_scan_public(args: argparse.Namespace) -> int:
         use_agents=use_agents,
     )
     print(json.dumps(result.to_dict(), indent=2))
-
-    discovery = result.discovery
-    log.info(
-        "discovery: %d manifests, %d dependencies (%d unpinned skipped), %d advisories",
-        discovery.get("manifests", 0),
-        discovery.get("dependencies", 0),
-        discovery.get("unpinned_skipped", 0),
-        discovery.get("advisories", 0),
-    )
-    if not result.coverage_complete:
-        log.warning(
-            "coverage is INCOMPLETE: %d dependencies were never checked. "
-            "Absence of findings for those is not evidence they are clean.",
-            discovery.get("unqueried", 0),
-        )
-    if not result.agents_enabled:
-        log.info("agent stages skipped: no model API key is set in the environment")
+    _report_discovery(result)
     return 0
 
 
@@ -229,6 +294,8 @@ def cmd_report(args: argparse.Namespace) -> int:
             "config_hash": run["config_hash"],
             "stages": stages,
             "spend_usd": round(db.spend(run_id), 4),
+            "unpriced_calls": db.unpriced_calls(run_id),
+            "spend_is_complete": db.unpriced_calls(run_id) == 0,
             "open_wishlist_items": len(db.open_wishes()),
         }
         ingest = stages["ingest"]
@@ -326,6 +393,15 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="harness", description=__doc__)
     parser.add_argument("--config", default="config/harness.yaml")
     parser.add_argument("--policy", default="config/policy.yaml")
+    parser.add_argument(
+        "--env-file",
+        metavar="PATH",
+        help=(
+            "load NAME=value pairs from PATH into the environment before running. "
+            "Shell-independent, so the same command works under fish, bash and CI. "
+            "Existing environment variables are never overwritten."
+        ),
+    )
     parser.add_argument("-v", "--verbose", action="store_true")
     sub = parser.add_subparsers(dest="command", required=True)
 
@@ -352,6 +428,20 @@ def build_parser() -> argparse.ArgumentParser:
     )
     scan.set_defaults(func=cmd_scan_public)
 
+    local = sub.add_parser(
+        "scan-local",
+        help="triage a working tree already on disk; no GitHub credential, no clone",
+    )
+    local.add_argument("--path", required=True, help="path to the repository root")
+    local.add_argument("--run-id")
+    local.add_argument(
+        "--agents",
+        choices=("auto", "on", "off"),
+        default="auto",
+        help="auto enables agent stages only when every configured provider has a key",
+    )
+    local.set_defaults(func=cmd_scan_local)
+
     report = sub.add_parser("report", help="metrics for a run (defaults to the latest)")
     report.add_argument("--run-id")
     report.set_defaults(func=cmd_report)
@@ -369,12 +459,17 @@ def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     _setup_logging(args.verbose)
     try:
+        if args.env_file:
+            log.info("%s", load_env_file(args.env_file).summary)
         return int(args.func(args))
+    except EnvFileError as exc:
+        log.error("env file: %s", exc)
+        return 2
     except ConfigError as exc:
-        log.error("config: %s", exc)
+        log.error("config: %s", _with_env_hint(str(exc)))
         return 2
     except ProviderConfigurationError as exc:
-        log.error("model provider: %s", exc)
+        log.error("model provider: %s", _with_env_hint(str(exc)))
         return 3
 
 

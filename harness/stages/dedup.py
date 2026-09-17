@@ -71,9 +71,14 @@ class DedupStage:
         self.cfg = cfg
         self.db = db
         self.ledger = ledger
-        self.client = client or ModelClient(cfg.model(ROLE), ledger)
         self.use_agent = use_agent
-        self.prompt = _PROMPT_PATH.read_text()
+        # Built only if this stage will actually ask a model something. A stage that is
+        # switched off must not demand a credential it never uses: `--agents off` is the
+        # documented free path, and it has to work in a checkout with no key at all.
+        self.client = client
+        if self.client is None and use_agent:
+            self.client = ModelClient(cfg.model(ROLE), ledger)
+        self.prompt = _PROMPT_PATH.read_text() if self.client is not None else ""
 
     def run(self, run_id: str) -> DedupReport:
         report = DedupReport(run_id=run_id)
@@ -103,6 +108,12 @@ class DedupStage:
         clustered: set[str],
         report: DedupReport,
     ) -> list[Cluster]:
+        if self.client is None:
+            # Unreachable through the constructor, which builds a client whenever
+            # use_agent is set. Degrading to the deterministic index rather than raising
+            # keeps a mis-wired call site from taking down a stage that has already
+            # produced usable clusters.
+            return []
         out: list[Cluster] = []
         for alert in remaining:
             if alert.alert_key in clustered:
@@ -131,6 +142,9 @@ class DedupStage:
         shortlist: list[str],
         report: DedupReport,
     ) -> list[Cluster]:
+        client = self.client
+        if client is None:
+            return []
         allowed = {alert.alert_key, *shortlist}
         request = ModelRequest(
             system=self.prompt,
@@ -144,7 +158,7 @@ class DedupStage:
             cacheable_prefix=self.prompt,
         )
         try:
-            response = self.client.complete(request, repo=alert.repo, stage=STAGE)
+            response = client.complete(request, repo=alert.repo, stage=STAGE)
             report.agent_calls += 1
             payload = response.json()
             validate("dedup_response", payload)

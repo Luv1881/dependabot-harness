@@ -21,7 +21,7 @@ from ..fsutil import iter_repo_files
 from ..models import BudgetLedger, ModelClient, ModelError, ModelRequest
 from ..models.client import ContextCeilingExceeded
 from ..schemas import SchemaViolation, validate
-from ..sources.checkout import CheckoutError, CheckoutManager
+from ..sources.checkout import CheckoutError, CheckoutManager, CheckoutProvider
 from ..util import RetryExhausted, age_days
 
 log = logging.getLogger(__name__)
@@ -103,7 +103,7 @@ class ReconStage:
         ledger: BudgetLedger,
         *,
         client: ModelClient | None = None,
-        checkouts: CheckoutManager | None = None,
+        checkouts: CheckoutProvider | None = None,
     ) -> None:
         self.cfg = cfg
         self.db = db

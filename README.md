@@ -83,14 +83,29 @@ python -m venv .venv && .venv/bin/pip install -e ".[dev]"
 # DeepSeek is OpenAI-compatible, so the openai extra covers it:
 #   pip install -e ".[openai]"
 
-cp .env.example .env && "$EDITOR" .env         # fill in GH_TOKEN and a model key
-set -a; . ./.env; set +a                       # export them into this shell
+cp .env.example .env && "$EDITOR" .env         # fill in a model key (GH_TOKEN too for `run`)
 
-harness run                                    # full pipeline over config/harness.yaml
+harness --env-file .env run                    # full pipeline over config/harness.yaml
+harness --env-file .env scan-local --path ./some/repo   # a tree you already have
+harness --env-file .env models                 # model ids this credential can call
+harness --config config/deepseek.yaml --env-file .env run
 harness resume --run-id <id>                   # continue, redoing nothing completed
 harness report                                 # metrics for the latest run
-harness models                                 # model ids this credential can call
 ```
+
+### Loading credentials without depending on your shell
+
+`--env-file PATH` reads `NAME=value` pairs into the process environment before anything
+else runs. It exists because the usual incantation is not portable: `set -a; . ./.env;
+set +a` is bash and zsh, and under fish it is three separate errors (no `allexport`, and a
+sourced file cannot contain a bare `KEY=value`). With the flag the command is identical in
+fish, bash, zsh, PowerShell and CI.
+
+The flag is the whole opt-in: the harness **never** loads `.env` on its own. A stray file
+in a working directory must not be able to change what a run does. Values already in the
+environment are never overwritten, so an inline override still beats the file —
+`DEEPSEEK_API_KEY=sk-other harness --env-file .env run`. When a required variable is
+missing and a `./.env` defines it, the error says so and names the flag.
 
 ### Where credentials go
 
@@ -144,14 +159,40 @@ With no validator, the mechanical checks still run in full, but nothing is ever 
 confirmed, so the dismissal gate **blocks every alert**. Verdicts are advisory; nothing
 gets closed. Point the validator at a second, different model to enable dismissal.
 
-### Scanning a public repository without Dependabot access
+### Scanning a repository
 
-Dependabot's alert API needs admin scope on the target repository. To triage a project you
-do not own, point the harness at OSV instead — same advisory data, any public repo:
+Three ways in, depending on what you have. All of them run the same stages, so a local
+scan tests the hosted path rather than a parallel one.
 
 ```bash
-harness scan-public --repo golang/go --ref master
+harness run                                          # the repos in your config
+harness scan-public  --repo golang/go --agents off    # a public repo via OSV (needs GH_TOKEN)
+harness scan-local   --path ./checkout                # a tree already on disk
 ```
+
+`scan-local` needs **no GitHub credential and no clone** — it reads the working tree and
+queries OSV for advisories. Useful for a private mirror, an air-gapped runner, a
+colleague's branch, or checking the harness itself. It never writes to the tree it is
+given, and `structure_hash` is derived from the watched files' contents with the same
+invalidation semantics as the API-backed version.
+
+### Budgets need prices
+
+The USD caps are only as good as the cost figures feeding them. A model outside the
+built-in table is reported as **unpriced**, and because the ledger then sums zeros the
+caps cannot fire — so an unpriced call is counted and reported rather than shown as
+`$0.00`, and startup warns by name. Declare the rates to switch enforcement on:
+
+```yaml
+models:
+  judgment:
+    provider: deepseek
+    model: deepseek-flash
+    pricing: {input_per_mtok: 0.28, output_per_mtok: 0.42}
+```
+
+A half-declared price is refused at startup: understating spend is worse than not stating
+it, because it quietly relaxes the cap it feeds.
 
 ## Evaluation
 
@@ -185,14 +226,18 @@ caught. Full results and the bug list: [`docs/validation.md`](docs/validation.md
 ## Security posture
 
 The harness clones and parses source from repositories it does not administer, and treats
-model output as untrusted input to the only write that closes an alert. A full audit
-against that threat model — thirteen findings, each fixed and pinned by a test — is
-recorded in [`docs/hardening.md`](docs/hardening.md).
+model output as untrusted input to the only write that closes an alert. Two audit passes
+against that threat model — eighteen findings, each fixed and pinned by a test — are
+recorded in [`docs/hardening.md`](docs/hardening.md). The second round was found by running
+the pipeline against real repositories on a real provider rather than by reading it, and it
+found the worst defect in the set: an npm `lockfileVersion: 1` file that produced zero
+dependencies and a **complete coverage** report over a lockfile holding a vulnerable lodash.
 
 The short version: the agent's tool surface is confined to the checkout and cannot be
 walked out of by a crafted glob, a symlink, or a `..` path; a GitHub token is never
-written to disk; a toolchain failure is never recorded as a clearance; and a permanent
-configuration error is never retried as a transient one.
+written to disk; a toolchain failure is never recorded as a clearance; an unpriced model is
+reported as unpriced rather than as free; and a permanent configuration error is never
+retried as a transient one.
 
 ## Verified against real tooling
 

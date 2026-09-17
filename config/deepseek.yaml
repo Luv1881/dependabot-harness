@@ -23,12 +23,21 @@ models:
   # Set the model id ONCE, here. Every role below refers back to it, so switching tiers
   # is a one-line edit rather than four that can silently disagree.
   #
-  # Tier names are marketing, not identifiers. Run `harness models` to see what the
-  # credential actually accepts; if the cheap tier is served under another name, change
-  # this line and nothing else.
+  # `deepseek-flash` is the real identifier, confirmed against the provider with
+  # `harness models` — which is why that command exists: the tier name is marketing and
+  # the id is not guessable. Re-run it rather than trusting this comment.
+  #
+  # `pricing` is deliberately NOT filled in. The rates on DeepSeek's pricing page are the
+  # authority, and a stale or invented number inside a budget mechanism is worse than a
+  # missing one: without it the harness reports those calls as unpriced and warns at
+  # startup, whereas a wrong figure would silently relax the cap it feeds.
+  #
+  # Copy the two rates from your console and the USD caps start being enforced:
+  #
+  #   pricing: {input_per_mtok: <input>, output_per_mtok: <output>}
   recon:
     provider: deepseek
-    model: &flash deepseek-chat
+    model: &flash deepseek-flash
     context_window: 131072        # 128k. The 25% ceiling derives from this: 32768.
     max_output_tokens: 8192       # the API rejects a larger completion, not truncates it
 
@@ -58,11 +67,11 @@ models:
   # requires explicit validator agreement — so **every alert is blocked from
   # auto-dismissal**. Nothing is closed on this configuration; verdicts are advisory.
   #
-  # To enable dismissals, point the validator at a second, different model. Uncomment:
+  # To enable dismissals, point the validator at a second, DIFFERENT model. Uncomment:
   #
   # validator:
   #   provider: deepseek
-  #   model: deepseek-reasoner
+  #   model: deepseek-v4-pro
   #   context_window: 131072
   #   max_output_tokens: 8192
   #

@@ -410,3 +410,39 @@ class TestInheritedVerdictsAreNeverAutoDismissed:
         decision = gate.evaluate(inherited, None)
         assert not decision.allowed
         assert "unconfirmed" in decision.blocked_by
+
+
+class TestDisabledAgentStageNeedsNoCredential:
+    """`--agents off` is the documented free path, so it must run in a checkout with no
+    model credentials at all. A stage that is switched off must not build a client it will
+    never call — found by running `scan-local --agents off` against a real repository with
+    a DeepSeek-only config and watching it exit 3 asking for a key it did not need."""
+
+    def test_a_disabled_stage_constructs_without_a_key(
+        self, cfg: HarnessConfig, db: Database, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        for name in ("ANTHROPIC_API_KEY", "OPENAI_API_KEY", "DEEPSEEK_API_KEY"):
+            monkeypatch.delenv(name, raising=False)
+        stage = DedupStage(cfg, db, BudgetLedger(cfg.budgets, db, "run1"), use_agent=False)
+        assert stage.client is None
+        assert stage.prompt == ""
+
+    def test_a_disabled_stage_still_clusters_deterministically(
+        self, cfg: HarnessConfig, db: Database, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        for name in ("ANTHROPIC_API_KEY", "OPENAI_API_KEY", "DEEPSEEK_API_KEY"):
+            monkeypatch.delenv(name, raising=False)
+        stage = DedupStage(cfg, db, BudgetLedger(cfg.budgets, db, "run1"), use_agent=False)
+        assert stage.run("run1").agent_calls == 0
+
+    def test_an_enabled_stage_still_refuses_without_a_key(
+        self, cfg: HarnessConfig, db: Database, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The relaxation must not leak: asking for the agent without a credential is
+        still a configuration error, reported before anything runs."""
+        from harness.models import ProviderConfigurationError
+
+        for name in ("ANTHROPIC_API_KEY", "OPENAI_API_KEY", "DEEPSEEK_API_KEY"):
+            monkeypatch.delenv(name, raising=False)
+        with pytest.raises(ProviderConfigurationError):
+            DedupStage(cfg, db, BudgetLedger(cfg.budgets, db, "run1"), use_agent=True)

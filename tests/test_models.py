@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
 from typing import Any
 
 import pytest
 
-from harness.config import BudgetConfig, ModelConfig
+from harness.config import BudgetConfig, ConfigError, ModelConfig, load_config
 from harness.db import Database
 from harness.models import (
     BudgetExceeded,
@@ -55,6 +56,22 @@ def model_cfg(**kw: Any) -> ModelConfig:
     )
     defaults.update(kw)
     return ModelConfig(**defaults)
+
+
+BASE_CONFIG = """
+github:
+  org: my-org
+  repos: [my-org/a]
+models:
+  recon: {provider: anthropic, model: claude-haiku-4-5}
+  judgment: {provider: anthropic, model: claude-opus-5}
+  validator: {provider: anthropic, model: claude-sonnet-5}
+  dedup: {provider: anthropic, model: claude-haiku-4-5}
+budgets: {per_repo_usd: 5.0, per_alert_usd: 0.4, per_run_usd: 100.0}
+cache:
+  invalidate_architecture_on_paths: ["**/go.mod"]
+output: {vex_dir: ./out/vex, sarif_dir: ./out/sarif}
+"""
 
 
 def budget_cfg(**kw: Any) -> BudgetConfig:
@@ -486,7 +503,6 @@ class TestDeepSeekProvider:
 class TestOutputTokenCeiling:
     """Stages ask for what their job needs, sized against one vendor's limits. A model
     with a lower output cap rejects the call outright, so the configured value wins."""
-
     class Recorder:
         name = "recorder"
 
@@ -537,6 +553,285 @@ class TestOutputTokenCeiling:
         client = self._client(db, max_output_tokens=1024)
         client.complete(request, repo="org/a", stage="judgment")
         assert request.max_tokens == 8_000
+
+
+class TestPricingIsNotOptional:
+    """An unpriced model must be reported as unpriced, never as free.
+
+    `price` returns 0.0 for a model outside its table, the ledger sums zeros, and the
+    budget check therefore observes a spend of nothing forever — so every cap silently
+    stops working. Discovered by running 36 paid DeepSeek calls and reading `spend_usd:
+    $0.000000` back.
+    """
+
+    def test_a_model_with_no_rates_is_identifiable(self) -> None:
+        from harness.models import is_priced
+
+        assert is_priced("claude-opus-5") is True
+        assert is_priced("deepseek-flash") is False
+
+    def test_declared_rates_make_a_model_priced(self) -> None:
+        from harness.models import is_priced
+
+        assert is_priced("deepseek-flash", (0.28, 0.42)) is True
+
+    def test_declared_rates_produce_a_real_cost(self) -> None:
+        from harness.models import price
+
+        usage = Usage(tokens_in=1_000_000, tokens_out=100_000)
+        assert price("deepseek-flash", usage, (1.0, 2.0)) == pytest.approx(1.2)
+
+    def test_an_unpriced_model_costs_zero_but_is_not_priced(self) -> None:
+        from harness.models import is_priced, price
+
+        usage = Usage(tokens_in=1_000_000, tokens_out=100_000)
+        assert price("deepseek-flash", usage) == 0.0
+        assert is_priced("deepseek-flash") is False
+
+    def test_a_half_declared_price_is_refused_by_config(self, tmp_path: Path) -> None:
+        """Understating spend is worse than not stating it, because it quietly relaxes
+        the cap it feeds."""
+        text = BASE_CONFIG.replace(
+            "  recon: {provider: anthropic, model: claude-haiku-4-5}",
+            "  recon:\n    provider: anthropic\n    model: claude-haiku-4-5\n"
+            "    pricing: {input_per_mtok: 1.0}",
+            1,
+        )
+        path = tmp_path / "h.yaml"
+        path.write_text(text)
+        with pytest.raises(ConfigError, match="output_per_mtok"):
+            load_config(path, require_github_auth=False)
+
+    def test_declared_rates_are_read_from_config(self, tmp_path: Path) -> None:
+        text = BASE_CONFIG.replace(
+            "  recon: {provider: anthropic, model: claude-haiku-4-5}",
+            "  recon:\n    provider: anthropic\n    model: claude-haiku-4-5\n"
+            "    pricing: {input_per_mtok: 0.28, output_per_mtok: 0.42}",
+            1,
+        )
+        path = tmp_path / "h.yaml"
+        path.write_text(text)
+        cfg = load_config(path, require_github_auth=False)
+        assert cfg.model("recon").pricing == (0.28, 0.42)
+        assert cfg.model("judgment").pricing is None
+
+    def test_declared_rates_reach_the_ledger(self, db: Database) -> None:
+        """End to end: a priced role records a non-zero cost."""
+        from harness.models import BudgetLedger
+
+        cfg = model_cfg(model="deepseek-flash", pricing=(1.0, 2.0))
+        ledger = BudgetLedger(budget_cfg(), db, "run1")
+        client = ModelClient(cfg, ledger, provider=FakeProvider(ok()), max_attempts=1)
+        client.complete(ModelRequest(system="s", user="u"), repo="org/a", stage="recon")
+        assert db.spend("run1") > 0
+        assert db.unpriced_calls("run1") == 0
+        assert client.unpriced is False
+
+    def test_an_unpriced_call_is_counted_and_reported(self, db: Database) -> None:
+        from harness.models import BudgetLedger
+
+        ledger = BudgetLedger(budget_cfg(), db, "run1")
+        client = ModelClient(
+            model_cfg(model="deepseek-flash"),
+            ledger,
+            provider=FakeProvider(ok()),
+            max_attempts=1,
+        )
+        client.complete(ModelRequest(system="s", user="u"), repo="org/a", stage="recon")
+        assert client.unpriced is True
+        assert db.unpriced_calls("run1") == 1
+        report = ledger.report()
+        assert report["spend_is_complete"] is False
+        assert report["unpriced_calls"] == 1
+
+    def test_a_fully_priced_run_reports_a_complete_spend(self, db: Database) -> None:
+        from harness.models import BudgetLedger
+
+        ledger = BudgetLedger(budget_cfg(), db, "run1")
+        client = ModelClient(
+            model_cfg(model="claude-opus-5"),
+            ledger,
+            provider=FakeProvider(ok()),
+            max_attempts=1,
+        )
+        client.complete(ModelRequest(system="s", user="u"), repo="org/a", stage="recon")
+        assert ledger.report()["spend_is_complete"] is True
+
+
+class TestOpenAiStopReasonVocabulary:
+    """`classify` reads a neutral stop reason. OpenAI-shaped vendors use different words
+    for the same states, and an untranslated `length` matches nothing — so a truncated
+    completion is classified as a complete, usable answer and the retry that exists for
+    exactly that case never fires.
+
+    Found by running against DeepSeek: a real call returned `finish_reason='stop'`.
+    """
+
+    def test_length_becomes_max_tokens(self) -> None:
+        from harness.models.client import _neutral_stop_reason
+
+        assert _neutral_stop_reason("length") == "max_tokens"
+        assert classify("partial", stop_reason=_neutral_stop_reason("length")).kind is (
+            ResponseClass.TRUNCATED
+        )
+
+    def test_content_filter_becomes_refusal(self) -> None:
+        from harness.models.client import _neutral_stop_reason
+
+        assert _neutral_stop_reason("content_filter") == "refusal"
+        assert classify("x", stop_reason=_neutral_stop_reason("content_filter")).kind is (
+            ResponseClass.REFUSAL
+        )
+
+    def test_ordinary_reasons_pass_through(self) -> None:
+        from harness.models.client import _neutral_stop_reason
+
+        assert _neutral_stop_reason("stop") == "stop"
+        assert _neutral_stop_reason("tool_calls") == "tool_calls"
+        assert _neutral_stop_reason(None) is None
+
+    def test_anthropic_vocabulary_is_untouched(self) -> None:
+        from harness.models.client import _neutral_stop_reason
+
+        assert _neutral_stop_reason("max_tokens") == "max_tokens"
+        assert _neutral_stop_reason("refusal") == "refusal"
+
+
+class TestToolCallTranslation:
+    """The compatible vendors do not return Anthropic-shaped content blocks, and their
+    tool calls arrive as JSON in a string. Without translation the judgment agent is
+    handed no tool surface at all and runs blind.
+    """
+
+    class Function:
+        def __init__(self, name: str, arguments: str) -> None:
+            self.name = name
+            self.arguments = arguments
+
+    class Call:
+        def __init__(self, id_: str, name: str, arguments: str) -> None:
+            self.id = id_
+            self.function = TestToolCallTranslation.Function(name, arguments)
+
+    class Message:
+        def __init__(self, content: str | None, calls: list[object]) -> None:
+            self.content = content
+            self.tool_calls = calls
+
+    def test_tool_declarations_become_openai_functions(self) -> None:
+        from harness.models.client import _openai_tools
+
+        translated = _openai_tools(
+            [
+                {
+                    "name": "grep",
+                    "description": "search",
+                    "input_schema": {"type": "object", "properties": {"pattern": {}}},
+                }
+            ]
+        )
+        assert translated[0]["type"] == "function"
+        assert translated[0]["function"]["name"] == "grep"
+        assert translated[0]["function"]["parameters"]["type"] == "object"
+
+    def test_a_declaration_without_a_schema_still_translates(self) -> None:
+        from harness.models.client import _openai_tools
+
+        translated = _openai_tools([{"name": "read_file"}])
+        assert translated[0]["function"]["parameters"] == {"type": "object", "properties": {}}
+
+    def test_arguments_come_back_as_a_mapping(self) -> None:
+        from harness.models.client import _tool_arguments
+
+        assert _tool_arguments('{"path": "a.go", "start": 3}') == {
+            "path": "a.go",
+            "start": 3,
+        }
+
+    def test_unparsable_arguments_degrade_to_empty_rather_than_raising(self) -> None:
+        """The tool then reports a missing argument and the model can correct itself;
+        raising would discard the whole turn over one malformed field."""
+        from harness.models.client import _tool_arguments
+
+        assert _tool_arguments("{not json") == {}
+        assert _tool_arguments(None) == {}
+        assert _tool_arguments("[1,2]") == {}
+
+    def test_a_response_becomes_neutral_blocks(self) -> None:
+        from harness.models.client import _neutral_blocks
+
+        message = self.Message("thinking", [self.Call("call_1", "grep", '{"pattern": "x"}')])
+        blocks = _neutral_blocks(message)
+        assert blocks[0] == {"type": "text", "text": "thinking"}
+        assert blocks[1] == {
+            "type": "tool_use",
+            "id": "call_1",
+            "name": "grep",
+            "input": {"pattern": "x"},
+        }
+
+    def test_the_agent_loop_can_read_the_calls(self) -> None:
+        from harness.models.client import _tool_calls
+
+        calls = _tool_calls(self.Message(None, [self.Call("c1", "grep", '{"pattern":"x"}')]))
+        assert calls[0]["name"] == "grep"
+        assert calls[0]["id"] == "c1"
+
+    def test_history_round_trips_through_openai_shape(self) -> None:
+        """The loop replays the assistant turn and the tool results; both have to be
+        expressed the way the vendor expects them."""
+        from harness.models.client import _openai_messages
+
+        request = ModelRequest(system="s", user="find it")
+        request.history.append(
+            {
+                "role": "assistant",
+                "content": [
+                    {"type": "text", "text": "looking"},
+                    {"type": "tool_use", "id": "c1", "name": "grep", "input": {"pattern": "x"}},
+                ],
+            }
+        )
+        request.history.append(
+            {
+                "role": "user",
+                "content": [{"type": "tool_result", "tool_use_id": "c1", "content": "a.go:1: x"}],
+            }
+        )
+        messages = _openai_messages(request)
+        assert messages[0] == {"role": "user", "content": "find it"}
+        assistant = messages[1]
+        assert assistant["role"] == "assistant"
+        assert assistant["content"] == "looking"
+        assert assistant["tool_calls"][0]["id"] == "c1"
+        assert assistant["tool_calls"][0]["function"]["name"] == "grep"
+        assert json.loads(assistant["tool_calls"][0]["function"]["arguments"]) == {
+            "pattern": "x"
+        }
+        assert messages[2] == {
+            "role": "tool",
+            "tool_call_id": "c1",
+            "content": "a.go:1: x",
+        }
+
+    def test_one_assistant_message_carries_text_and_calls_together(self) -> None:
+        """Two consecutive assistant turns are rejected by the API."""
+        from harness.models.client import _openai_assistant_turn
+
+        turns = _openai_assistant_turn(
+            [
+                {"type": "text", "text": "looking"},
+                {"type": "tool_use", "id": "c1", "name": "grep", "input": {}},
+            ]
+        )
+        assert len(turns) == 1
+        assert turns[0]["content"] == "looking"
+        assert len(turns[0]["tool_calls"]) == 1
+
+    def test_an_empty_turn_emits_nothing(self) -> None:
+        from harness.models.client import _openai_assistant_turn
+
+        assert _openai_assistant_turn([]) == []
 
 
 class TestContextEstimateIsPessimistic:

@@ -13,14 +13,16 @@ from __future__ import annotations
 import logging
 import os
 from dataclasses import dataclass, field, replace
+from pathlib import Path
 from typing import Any
 
 from .config import HarnessConfig, load_policy
 from .db import Database
 from .models import BudgetLedger, required_api_key_env
 from .policy import PolicyEngine
-from .sources.checkout import CheckoutManager
+from .sources.checkout import CheckoutManager, CheckoutProvider
 from .sources.github import GithubClient
+from .sources.local import LocalCheckout, LocalRepo, local_repo_label
 from .sources.osv_scan import OsvAlertSource
 from .stages.dedup import DedupStage, propagate_verdicts
 from .stages.emit import EmitStage
@@ -32,6 +34,10 @@ from .stages.recon import ReconStage
 from .stages.validate import ValidationStage
 
 log = logging.getLogger(__name__)
+
+
+class ScanError(RuntimeError):
+    """The scan cannot be attempted at all — a bad path, not a failed measurement."""
 
 
 @dataclass
@@ -94,6 +100,11 @@ def scan_public_repo(
     ref: str | None = None,
     use_agents: bool | None = None,
 ) -> ScanResult:
+    """Triage a repository the harness does not administer, via OSV.
+
+    The git tree, the structure hash and the manifest fetches come from GitHub, so this
+    needs a credential even for a public repository.
+    """
     enabled = agents_available(cfg) if use_agents is None else use_agents
     scoped = scoped_config(cfg, repo)
     result = ScanResult(repo=repo, run_id=run_id, agents_enabled=enabled)
@@ -102,10 +113,80 @@ def scan_public_repo(
     checkouts = CheckoutManager(scoped.storage.checkout_dir, scoped.github)
     commit_sha = ref or github.default_branch_sha(repo)
     result.commit_sha = commit_sha
-
     checkout = checkouts.ensure(repo, commit_sha)
     source = OsvAlertSource(github, checkout.path)
+    try:
+        _run_pipeline(
+            scoped,
+            source,
+            checkouts,
+            result,
+            run_id,
+            policy_path=policy_path,
+            enabled=enabled,
+        )
+    finally:
+        source.close()
+    return result
 
+
+def scan_local_repo(
+    cfg: HarnessConfig,
+    path: str | Path,
+    run_id: str,
+    *,
+    policy_path: str = "config/policy.yaml",
+    use_agents: bool | None = None,
+) -> ScanResult:
+    """Triage a working tree already on disk. No GitHub credential, no clone.
+
+    The advisory database is still queried over the network — that is the discovery
+    engine and there is no substitute for it — but everything about *the code under
+    analysis* comes from the directory, which is never written to.
+    """
+    root = Path(path)
+    if not root.is_dir():
+        raise ScanError(f"not a directory: {root}")
+    root = root.resolve()
+
+    enabled = agents_available(cfg) if use_agents is None else use_agents
+    repo = local_repo_label(root)
+    scoped = scoped_config(cfg, repo)
+    result = ScanResult(repo=repo, run_id=run_id, agents_enabled=enabled)
+
+    host = LocalRepo(root)
+    result.commit_sha = host.default_branch_sha(repo)
+    source = OsvAlertSource(host, root)
+    try:
+        _run_pipeline(
+            scoped,
+            source,
+            LocalCheckout(root),
+            result,
+            run_id,
+            policy_path=policy_path,
+            enabled=enabled,
+        )
+    finally:
+        source.close()
+    return result
+
+
+def _run_pipeline(
+    scoped: HarnessConfig,
+    source: OsvAlertSource,
+    checkouts: CheckoutProvider,
+    result: ScanResult,
+    run_id: str,
+    *,
+    policy_path: str,
+    enabled: bool,
+) -> None:
+    """The stage sequence, shared by every way of obtaining a working tree.
+
+    Identical for a clone and for a directory: if the local path produced different
+    results it would test nothing about the hosted path.
+    """
     with Database(scoped.storage.db_path) as db:
         db.start_run(run_id, scoped.hash)
         ledger = BudgetLedger(scoped.budgets, db, run_id)
@@ -151,9 +232,5 @@ def scan_public_repo(
         except BaseException:
             db.finish_run(run_id, "aborted")
             raise
-        finally:
-            source.close()
 
         result.spend_usd = db.spend(run_id)
-
-    return result

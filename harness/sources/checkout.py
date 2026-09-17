@@ -23,6 +23,7 @@ import uuid
 from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Protocol, runtime_checkable
 
 from ..config import GithubConfig, valid_repo
 
@@ -30,6 +31,18 @@ _CLONE_TIMEOUT_SECONDS = 600
 """No git subprocess may run unbounded. A hung fetch hangs the whole run otherwise."""
 
 _REF_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]{0,254}$")
+
+
+@runtime_checkable
+class CheckoutProvider(Protocol):
+    """What the stages need from whatever supplies a working tree.
+
+    :class:`CheckoutManager` fetches one; :class:`~harness.sources.local.LocalCheckout`
+    returns a tree the operator already has. Stages depend on this rather than on the
+    fetching implementation, so a local scan needs no network and no clone.
+    """
+
+    def ensure(self, repo: str, commit_sha: str) -> Checkout: ...
 
 
 class CheckoutError(RuntimeError):

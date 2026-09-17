@@ -128,6 +128,122 @@ class TestParserSurface:
         parser = build_parser()
         assert parser.parse_args(["models"]).command == "models"
 
+    def test_scan_local_is_a_command(self) -> None:
+        parser = build_parser()
+        args = parser.parse_args(["scan-local", "--path", "/tmp/x"])
+        assert args.command == "scan-local"
+        assert args.path == "/tmp/x"
+
+    def test_env_file_is_a_global_option(self) -> None:
+        parser = build_parser()
+        assert parser.parse_args(["--env-file", ".env", "run"]).env_file == ".env"
+        assert parser.parse_args(["run"]).env_file is None
+
+
+class TestEnvFileIsAppliedBeforeConfigLoad:
+    """The shell incantation for exporting a dotenv file is not portable — `set -a; .
+    ./.env; set +a` is bash, and under fish it is three errors. Accepting the file
+    directly removes the shell from the equation."""
+
+    def _config(self, tmp_path: Path) -> Path:
+        path = tmp_path / "harness.yaml"
+        path.write_text(DEEPSEEK_CONFIG)
+        return path
+
+    def test_a_key_can_arrive_only_via_the_env_file(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        from harness import cli
+
+        monkeypatch.setenv("GH_TOKEN", "ghp_test")
+        for name in ("ANTHROPIC_API_KEY", "OPENAI_API_KEY", "DEEPSEEK_API_KEY"):
+            monkeypatch.delenv(name, raising=False)
+        env = tmp_path / ".env"
+        env.write_text("ANTHROPIC_API_KEY=sk-a\nOPENAI_API_KEY=sk-b\nDEEPSEEK_API_KEY=sk-c\n")
+        monkeypatch.setattr(cli, "list_models", lambda provider, key: [f"{provider}-m"])
+
+        assert (
+            cli.main(
+                ["--config", str(self._config(tmp_path)), "--env-file", str(env), "models"]
+            )
+            == 0
+        )
+        assert "deepseek-m" in capsys.readouterr().out
+
+    def test_the_file_is_not_loaded_without_the_flag(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        """Implicit secret loading is how a stray file in a working directory changes what
+        a run does. The flag is the whole opt-in."""
+        from harness import cli
+
+        monkeypatch.setenv("GH_TOKEN", "ghp_test")
+        for name in ("ANTHROPIC_API_KEY", "OPENAI_API_KEY", "DEEPSEEK_API_KEY"):
+            monkeypatch.delenv(name, raising=False)
+        (tmp_path / ".env").write_text("DEEPSEEK_API_KEY=sk-c\n")
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setattr(cli, "list_models", lambda provider, key: [f"{provider}-m"])
+
+        assert cli.main(["--config", str(self._config(tmp_path)), "models"]) == 1
+        assert "DEEPSEEK_API_KEY is not set" in capsys.readouterr().out
+
+    def test_a_broken_env_file_exits_two_without_a_traceback(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        from harness import cli
+
+        monkeypatch.setenv("GH_TOKEN", "ghp_test")
+        bad = tmp_path / "bad.env"
+        bad.write_text("NOT A PAIR\n")
+        argv = ["--config", str(self._config(tmp_path)), "--env-file", str(bad), "run"]
+        assert cli.main(argv) == 2
+
+    def test_a_missing_env_file_exits_two(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from harness import cli
+
+        monkeypatch.setenv("GH_TOKEN", "ghp_test")
+        assert cli.main(["--env-file", str(tmp_path / "absent"), "report"]) == 2
+
+    def test_a_credential_error_points_at_a_dotenv_that_has_it(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The harness never loads `.env` on its own. But when the missing variable is
+        sitting in a file right there, saying so turns a hunt into a one-line fix."""
+        from harness.cli import _with_env_hint
+
+        monkeypatch.chdir(tmp_path)
+        (tmp_path / ".env").write_text("DEEPSEEK_API_KEY=sk-x\n")
+        hinted = _with_env_hint("model credentials are missing: needs DEEPSEEK_API_KEY.")
+        assert "--env-file .env" in hinted
+        assert "DEEPSEEK_API_KEY" in hinted
+
+    def test_no_hint_when_the_file_does_not_define_the_variable(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from harness.cli import _with_env_hint
+
+        monkeypatch.chdir(tmp_path)
+        (tmp_path / ".env").write_text("SOMETHING_ELSE=1\n")
+        message = "needs DEEPSEEK_API_KEY."
+        assert _with_env_hint(message) == message
+
+    def test_no_hint_when_there_is_no_dotenv(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from harness.cli import _with_env_hint
+
+        monkeypatch.chdir(tmp_path)
+        message = "needs DEEPSEEK_API_KEY."
+        assert _with_env_hint(message) == message
+
 
 DEEPSEEK_CONFIG = BASE % {
     "recon_provider": "deepseek",

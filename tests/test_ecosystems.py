@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
+from typing import Any, ClassVar
 
 import pytest
 
@@ -16,7 +18,7 @@ from harness.ecosystems import (
     get_adapter,
     supported_ecosystems,
 )
-from harness.ecosystems.base import Dependency
+from harness.ecosystems.base import Dependency, UnparsableManifest
 
 
 class TestRegistry:
@@ -250,6 +252,113 @@ class TestReachabilityNotImplemented:
         result = adapter.reachability(tmp_path, None)  # type: ignore[attr-defined]
         assert result.method == "failed"
         assert result.confidence == 0.0
+
+
+class TestNpmLockfileShapes:
+    """Both lockfile shapes are in the wild and both must be read.
+
+    `lockfileVersion` 1 nests dependencies by install path; 2 and 3 use a flat map. A
+    reader that understands only the modern shape finds zero dependencies in the older
+    one and reports complete coverage over a file full of vulnerable packages — found by
+    scanning a real repository whose lockfile is version 1.
+    """
+
+    V1: ClassVar[dict[str, Any]] = {
+        "lockfileVersion": 1,
+        "dependencies": {
+            "lodash": {"version": "4.17.20"},
+            "mkdirp": {
+                "version": "0.5.1",
+                "dependencies": {"minimist": {"version": "0.0.8", "dev": True}},
+            },
+            "nested-again": {
+                "version": "1.0.0",
+                "dependencies": {
+                    "deeper": {
+                        "version": "2.0.0",
+                        "dependencies": {"deepest": {"version": "3.0.0"}},
+                    }
+                },
+            },
+        },
+    }
+
+    def test_a_v1_lockfile_yields_its_nested_dependencies(self) -> None:
+        found = {
+            (d.name, d.version) for d in NpmAdapter().parse_dependencies(json.dumps(self.V1))
+        }
+        assert found == {
+            ("lodash", "4.17.20"),
+            ("mkdirp", "0.5.1"),
+            ("minimist", "0.0.8"),
+            ("nested-again", "1.0.0"),
+            ("deeper", "2.0.0"),
+            ("deepest", "3.0.0"),
+        }
+
+    def test_a_v1_nested_dev_dependency_stays_dev(self) -> None:
+        parsed = {d.name: d for d in NpmAdapter().parse_dependencies(json.dumps(self.V1))}
+        assert parsed["minimist"].scope == Scope.DEVELOPMENT
+        assert parsed["lodash"].scope == Scope.RUNTIME
+
+    def test_a_v2_lockfile_still_uses_the_flat_map(self) -> None:
+        payload = {
+            "lockfileVersion": 2,
+            "packages": {
+                "": {"name": "app", "version": "1.0.0"},
+                "node_modules/lodash": {"version": "4.17.15"},
+                "node_modules/a/node_modules/lodash": {"version": "4.17.21"},
+                "node_modules/jest": {"version": "29.0.0", "dev": True},
+            },
+            "dependencies": {"lodash": {"version": "4.17.15"}},
+        }
+        found = {(d.name, d.version) for d in NpmAdapter().parse_dependencies(json.dumps(payload))}
+        assert found == {("lodash", "4.17.15"), ("lodash", "4.17.21"), ("jest", "29.0.0")}
+
+    def test_two_versions_of_the_same_package_are_both_kept(self) -> None:
+        """A v1 tree legitimately holds several versions. Collapsing them would hide the
+        vulnerable one whenever a fixed copy is installed elsewhere in the tree."""
+        text = json.dumps(
+            {
+                "lockfileVersion": 1,
+                "dependencies": {
+                    "a": {
+                        "version": "1.0.0",
+                        "dependencies": {"lodash": {"version": "4.17.15"}},
+                    },
+                    "lodash": {"version": "4.17.21"},
+                },
+            }
+        )
+        versions = {
+            d.version for d in NpmAdapter().parse_dependencies(text) if d.name == "lodash"
+        }
+        assert versions == {"4.17.15", "4.17.21"}
+
+    def test_an_unrecognised_lockfile_is_refused_not_reported_empty(self) -> None:
+        """Returning `[]` here would be counted as a repository with no dependencies,
+        keeping `coverage_complete` true over a file nobody understood."""
+        text = json.dumps({"lockfileVersion": 4, "entries": {"a": {"version": "1.0.0"}}})
+        with pytest.raises(UnparsableManifest, match="neither a 'packages' map"):
+            NpmAdapter().parse_dependencies(text)
+
+    def test_an_empty_lockfile_is_legitimately_empty(self) -> None:
+        assert NpmAdapter().parse_dependencies("{}") == []
+
+    def test_a_deeply_nested_v1_tree_is_refused_rather_than_truncated(self) -> None:
+        """Truncating would drop exactly the transitive dependencies most likely to be
+        vulnerable while still reporting complete coverage."""
+        node: dict[str, object] = {"leaf": {"version": "1.0.0"}}
+        for index in range(250):
+            node = {f"p{index}": {"version": "1.0.0", "dependencies": node}}
+        with pytest.raises(UnparsableManifest, match="nested deeper"):
+            NpmAdapter().parse_dependencies(
+                json.dumps({"lockfileVersion": 1, "dependencies": node})
+            )
+
+    def test_a_v1_entry_that_is_not_a_mapping_is_ignored(self) -> None:
+        text = json.dumps({"lockfileVersion": 1, "dependencies": {"a": "not-a-dict"}})
+        assert NpmAdapter().parse_dependencies(text) == []
 
 
 class TestIsPinned:

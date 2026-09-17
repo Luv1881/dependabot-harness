@@ -218,7 +218,7 @@ class OpenAICompatibleProvider(ModelProvider):
 
     def complete(self, request: ModelRequest, model: str) -> ModelResponse:
         client = self._ensure_client()
-        messages = []
+        messages: list[dict[str, Any]] = []
         if request.cacheable_prefix or request.system:
             messages.append(
                 {
@@ -226,11 +226,17 @@ class OpenAICompatibleProvider(ModelProvider):
                     "content": f"{request.cacheable_prefix}\n\n{request.system}".strip(),
                 }
             )
-        messages.extend(request.messages())
+        messages.extend(_openai_messages(request))
 
-        raw = client.chat.completions.create(
-            model=model, max_tokens=request.max_tokens, messages=messages
-        )
+        kwargs: dict[str, Any] = {
+            "model": model,
+            "max_tokens": request.max_tokens,
+            "messages": messages,
+        }
+        if request.tools:
+            kwargs["tools"] = _openai_tools(request.tools)
+
+        raw = client.chat.completions.create(**kwargs)
         choice = raw.choices[0]
         usage = Usage(
             tokens_in=getattr(raw.usage, "prompt_tokens", 0) or 0,
@@ -239,9 +245,151 @@ class OpenAICompatibleProvider(ModelProvider):
         return ModelResponse(
             text=choice.message.content or "",
             usage=usage,
-            stop_reason=getattr(choice, "finish_reason", None),
+            stop_reason=_neutral_stop_reason(getattr(choice, "finish_reason", None)),
             model=getattr(raw, "model", model),
+            tool_calls=_tool_calls(choice.message),
+            raw_content=_neutral_blocks(choice.message),
         )
+
+
+_STOP_REASONS = {
+    "length": "max_tokens",
+    "content_filter": "refusal",
+}
+"""OpenAI-shaped vocabulary translated to the neutral one `classify` reads.
+
+Without this a truncated completion arrives as `finish_reason='length'`, which matches
+none of the neutral values, and is therefore classified as a complete, usable answer. The
+truncated-and-retried path exists precisely so a clipped response is not mistaken for a
+finished one.
+"""
+
+
+def _neutral_stop_reason(finish_reason: Any) -> str | None:
+    if finish_reason is None:
+        return None
+    text = str(finish_reason)
+    return _STOP_REASONS.get(text, text)
+
+
+def _neutral_blocks(message: Any) -> list[dict[str, Any]]:
+    """The assistant turn in the neutral shape the tool loop replays.
+
+    Anthropic returns content blocks natively; the compatible vendors do not. Producing
+the same shape here keeps one history format and one translation point, rather than two
+formats the loop would have to tell apart.
+    """
+    blocks: list[dict[str, Any]] = []
+    if getattr(message, "content", None):
+        blocks.append({"type": "text", "text": message.content})
+    for call in getattr(message, "tool_calls", None) or []:
+        function = getattr(call, "function", None)
+        blocks.append(
+            {
+                "type": "tool_use",
+                "id": getattr(call, "id", ""),
+                "name": getattr(function, "name", ""),
+                "input": _tool_arguments(getattr(function, "arguments", None)),
+            }
+        )
+    return blocks
+
+
+def _tool_calls(message: Any) -> list[dict[str, Any]]:
+    return [block for block in _neutral_blocks(message) if block["type"] == "tool_use"]
+
+
+def _tool_arguments(raw: Any) -> dict[str, Any]:
+    """A tool call's arguments, which arrive as a JSON-encoded string.
+
+    Unparsable arguments become an empty mapping rather than an exception. The tool then
+    reports a missing argument back to the model, which can correct itself; raising here
+    would discard the whole turn over one malformed field.
+    """
+    if isinstance(raw, dict):
+        return raw
+    if not raw:
+        return {}
+    try:
+        parsed = json.loads(raw)
+    except (json.JSONDecodeError, TypeError):
+        log.warning("tool call arrived with unparsable arguments; treating as empty")
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
+
+
+def _openai_tools(tools: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Translate the neutral (Anthropic-shaped) tool declarations to OpenAI's."""
+    return [
+        {
+            "type": "function",
+            "function": {
+                "name": tool["name"],
+                "description": tool.get("description", ""),
+                "parameters": tool.get("input_schema") or {"type": "object", "properties": {}},
+            },
+        }
+        for tool in tools
+    ]
+
+
+def _openai_messages(request: ModelRequest) -> list[dict[str, Any]]:
+    """Neutral conversation to OpenAI's wire format, tool round-trips included."""
+    out: list[dict[str, Any]] = []
+    for message in request.messages():
+        role = message.get("role")
+        content = message.get("content")
+        if isinstance(content, str):
+            out.append({"role": role, "content": content})
+            continue
+        if not isinstance(content, list):
+            continue
+        if role == "assistant":
+            out.extend(_openai_assistant_turn(content))
+        else:
+            out.extend(_openai_tool_results(content))
+    return out
+
+
+def _openai_assistant_turn(blocks: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """One assistant message, carrying text and any tool calls together.
+
+    Emitting them separately would produce two consecutive assistant turns, which the API
+    rejects and which would also lose the association between a call and the text that
+    motivated it.
+    """
+    text = "".join(b.get("text", "") for b in blocks if b.get("type") == "text")
+    calls = [
+        {
+            "id": b.get("id", ""),
+            "type": "function",
+            "function": {
+                "name": b.get("name", ""),
+                "arguments": json.dumps(b.get("input") or {}),
+            },
+        }
+        for b in blocks
+        if b.get("type") == "tool_use"
+    ]
+    if not text and not calls:
+        return []
+    message: dict[str, Any] = {"role": "assistant", "content": text or None}
+    if calls:
+        message["tool_calls"] = calls
+    return [message]
+
+
+def _openai_tool_results(blocks: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """One `tool` message per result: OpenAI keys results by call id, not by position."""
+    return [
+        {
+            "role": "tool",
+            "tool_call_id": b.get("tool_use_id", ""),
+            "content": str(b.get("content", "")),
+        }
+        for b in blocks
+        if b.get("type") == "tool_result"
+    ]
 
 
 class OpenAIProvider(OpenAICompatibleProvider):
@@ -348,6 +496,7 @@ class ModelClient:
                 model=self.cfg.model,
                 usage=response.usage,
                 alert_key=alert_key,
+                rates=self.cfg.pricing,
             )
             if not response.is_usable:
                 raise ModelError(
@@ -413,4 +562,5 @@ class ModelClient:
 
     @property
     def unpriced(self) -> bool:
-        return not is_priced(self.cfg.model)
+        """Whether this role's cost cannot be computed, which disarms the budget caps."""
+        return not is_priced(self.cfg.model, self.cfg.pricing)

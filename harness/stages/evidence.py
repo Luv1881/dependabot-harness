@@ -22,7 +22,7 @@ from ..ecosystems.base import ReachabilityResult
 from ..evidence import EvidenceBuilder, EvidenceBundle
 from ..evidence.bundle import is_shallow
 from ..schemas import validate
-from ..sources.checkout import CheckoutError, CheckoutManager
+from ..sources.checkout import CheckoutError, CheckoutManager, CheckoutProvider
 
 log = logging.getLogger(__name__)
 
@@ -71,7 +71,7 @@ class EvidenceStage:
         cfg: HarnessConfig,
         db: Database,
         *,
-        checkouts: CheckoutManager | None = None,
+        checkouts: CheckoutProvider | None = None,
     ) -> None:
         self.cfg = cfg
         self.db = db

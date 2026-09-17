@@ -21,7 +21,7 @@ from ..models import BudgetLedger, ModelClient, ModelError, ModelRequest
 from ..models.client import ContextCeilingExceeded
 from ..schemas import SchemaViolation
 from ..schemas import validate as validate_schema
-from ..sources.checkout import CheckoutError, CheckoutManager
+from ..sources.checkout import CheckoutError, CheckoutManager, CheckoutProvider
 from ..util import RetryExhausted, canonical_json
 from ..validation.mechanical import MechanicalReport, check_verdict
 
@@ -78,7 +78,7 @@ class ValidationStage:
         ledger: BudgetLedger,
         *,
         client: ModelClient | None = None,
-        checkouts: CheckoutManager | None = None,
+        checkouts: CheckoutProvider | None = None,
     ) -> None:
         self.cfg = cfg
         self.db = db

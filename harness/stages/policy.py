@@ -17,7 +17,7 @@ from ..config import HarnessConfig
 from ..db import AlertRecord, Database
 from ..policy import ClearanceStats, PolicyEngine, RepoFactsProvider, RuleContext, RuleOutcome
 from ..policy.context import OutcomeKind
-from ..sources.checkout import CheckoutError, CheckoutManager
+from ..sources.checkout import CheckoutError, CheckoutManager, CheckoutProvider
 
 log = logging.getLogger(__name__)
 
@@ -44,7 +44,7 @@ class PolicyStage:
         db: Database,
         engine: PolicyEngine,
         *,
-        checkouts: CheckoutManager | None = None,
+        checkouts: CheckoutProvider | None = None,
     ) -> None:
         self.cfg = cfg
         self.db = db

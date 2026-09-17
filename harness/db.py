@@ -130,8 +130,7 @@ CREATE INDEX IF NOT EXISTS idx_verdicts_created ON verdicts(alert_key, created_a
 CREATE TABLE IF NOT EXISTS budget_ledger (
   run_id TEXT, repo TEXT, alert_key TEXT, stage TEXT,
   cost_usd REAL, at TEXT
-);
-CREATE INDEX IF NOT EXISTS idx_ledger_run_repo ON budget_ledger(run_id, repo);
+);CREATE INDEX IF NOT EXISTS idx_ledger_run_repo ON budget_ledger(run_id, repo);
 CREATE INDEX IF NOT EXISTS idx_ledger_alert ON budget_ledger(run_id, alert_key);
 
 CREATE TABLE IF NOT EXISTS wishlist (
@@ -193,6 +192,7 @@ class Database:
     def migrate(self) -> None:
         self._conn.executescript(_SCHEMA)
         self._add_column_if_missing("verdicts", "structure_hash", "TEXT")
+        self._add_column_if_missing("budget_ledger", "priced", "INTEGER")
         self._conn.execute(
             "INSERT INTO schema_meta(key, value) VALUES('version', ?) "
             "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
@@ -486,13 +486,26 @@ class Database:
         stage: str,
         cost_usd: float,
         alert_key: str | None = None,
+        priced: bool = True,
     ) -> None:
-        """Every model call lands here. Recon uses ``alert_key=None`` (repo-level)."""
+        """Every model call lands here. Recon uses ``alert_key=None`` (repo-level).
+
+        ``priced`` distinguishes a modelled cost from a placeholder zero. Without it a
+        run on a model whose rates are unknown reports `$0.00` and looks free.
+        """
         self._conn.execute(
-            "INSERT INTO budget_ledger(run_id, repo, alert_key, stage, cost_usd, at) "
-            "VALUES(?,?,?,?,?,?)",
-            (run_id, repo, alert_key, stage, cost_usd, utcnow()),
+            "INSERT INTO budget_ledger(run_id, repo, alert_key, stage, cost_usd, at, priced) "
+            "VALUES(?,?,?,?,?,?,?)",
+            (run_id, repo, alert_key, stage, cost_usd, utcnow(), int(priced)),
         )
+
+    def unpriced_calls(self, run_id: str) -> int:
+        """Calls whose cost could not be computed, so the spend total is not a measurement."""
+        row = self._conn.execute(
+            "SELECT COUNT(*) AS n FROM budget_ledger WHERE run_id=? AND COALESCE(priced, 1)=0",
+            (run_id,),
+        ).fetchone()
+        return int(row["n"])
 
     def spend(
         self, run_id: str, *, repo: str | None = None, alert_key: str | None = None

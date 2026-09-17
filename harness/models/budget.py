@@ -57,12 +57,19 @@ class Usage:
         return self.tokens_in + self.tokens_out + self.cache_read_tokens + self.cache_write_tokens
 
 
-def price(model: str, usage: Usage) -> float:
-    """Cost in USD. An unpriced model is charged zero and must be surfaced, not guessed."""
-    rates = PRICING_USD_PER_MTOK.get(model)
-    if rates is None:
+def price(model: str, usage: Usage, rates: tuple[float, float] | None = None) -> float:
+    """Cost in USD for one call, or 0.0 when the model's rates are unknown.
+
+    A 0.0 here means *unpriced*, not *free*, and the two must not be conflated. An
+    unpriced model silently disarms every budget cap, because the ledger sums zeros and
+    `check` can never observe the threshold. Callers therefore ask :func:`is_priced`
+    first and record the outcome; the run report carries the count of calls whose cost is
+    unknown so a `$0.00` total cannot be read as a spend of nothing.
+    """
+    resolved = rates or PRICING_USD_PER_MTOK.get(model)
+    if resolved is None:
         return 0.0
-    input_rate, output_rate = rates
+    input_rate, output_rate = resolved
     return (
         usage.tokens_in * input_rate
         + usage.cache_read_tokens * input_rate * _CACHE_READ_MULTIPLIER
@@ -71,8 +78,9 @@ def price(model: str, usage: Usage) -> float:
     ) / 1_000_000
 
 
-def is_priced(model: str) -> bool:
-    return model in PRICING_USD_PER_MTOK
+def is_priced(model: str, rates: tuple[float, float] | None = None) -> bool:
+    """Whether a cost can be computed at all, from declared rates or the built-in table."""
+    return rates is not None or model in PRICING_USD_PER_MTOK
 
 
 @dataclass
@@ -127,22 +135,32 @@ class BudgetLedger:
         model: str,
         usage: Usage,
         alert_key: str | None = None,
+        rates: tuple[float, float] | None = None,
     ) -> float:
-        """Ledger one model call. Recon uses ``alert_key=None`` because it is repo-level."""
-        cost = price(model, usage)
+        """Ledger one model call. Recon uses ``alert_key=None`` because it is repo-level.
+
+        ``priced`` is stored alongside the cost. A falsey record means the figure beside it
+        is a placeholder rather than a measurement, and the report says so.
+        """
+        priced = is_priced(model, rates)
+        cost = price(model, usage, rates)
         self.db.record_cost(
             run_id=self.run_id,
             repo=repo,
             stage=stage,
             cost_usd=cost,
             alert_key=alert_key,
+            priced=priced,
         )
         return cost
 
     def report(self) -> dict[str, Any]:
+        unpriced = self.db.unpriced_calls(self.run_id)
         return {
             "run_id": self.run_id,
             "spend_usd": round(self.db.spend(self.run_id), 6),
+            "unpriced_calls": unpriced,
+            "spend_is_complete": unpriced == 0,
             "caps": {
                 "per_run_usd": self.cfg.per_run_usd,
                 "per_repo_usd": self.cfg.per_repo_usd,

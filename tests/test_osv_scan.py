@@ -116,6 +116,41 @@ class TestDiscovery:
         (tmp_path / "linked").symlink_to(outside, target_is_directory=True)
         assert list(discover_dependencies(tmp_path, ScanStats())) == []
 
+    def test_a_lockfile_in_an_unrecognised_shape_is_a_gap_not_a_clean_bill(
+        self, tmp_path: Path
+    ) -> None:
+        """Found by scanning a real repository: `dependabot/demo` ships a
+        `lockfileVersion: 1` lockfile. Reading only the modern `packages` shape found zero
+        dependencies, kept `coverage_complete` true, and reported a clean repository over a
+        file holding a known-vulnerable lodash."""
+        write(tmp_path, "package-lock.json", json.dumps({"lockfileVersion": 4, "entries": {}}))
+        stats = ScanStats()
+        assert list(discover_dependencies(tmp_path, stats)) == []
+        assert stats.coverage_complete is False
+        assert any("dependencies were never checked" in e for e in stats.errors)
+
+    def test_a_v1_lockfile_now_yields_its_dependencies(self, tmp_path: Path) -> None:
+        write(
+            tmp_path,
+            "package-lock.json",
+            json.dumps(
+                {
+                    "lockfileVersion": 1,
+                    "dependencies": {
+                        "lodash": {"version": "4.17.20"},
+                        "mkdirp": {
+                            "version": "0.5.1",
+                            "dependencies": {"minimist": {"version": "0.0.8"}},
+                        },
+                    },
+                }
+            ),
+        )
+        stats = ScanStats()
+        found = {f.dependency.name for f in discover_dependencies(tmp_path, stats)}
+        assert found == {"lodash", "mkdirp", "minimist"}
+        assert stats.coverage_complete is True
+
 
 class StubGithub:
     def default_branch_sha(self, repo: str) -> str:

@@ -22,11 +22,12 @@ import httpx
 
 from ..cvss import parse_vector
 from ..ecosystems import get_adapter
-from ..ecosystems.base import Dependency
+from ..ecosystems.base import Dependency, UnparsableManifest
 from ..fsutil import iter_repo_files
 from ..util import retry_with_backoff
 from ..versions import Version, try_parse
-from .github import GithubClient, RawAlert
+from . import RepoHost
+from .github import RawAlert
 from .osv import OsvClient
 
 log = logging.getLogger(__name__)
@@ -103,7 +104,7 @@ class OsvAlertSource:
 
     def __init__(
         self,
-        github: GithubClient,
+        github: RepoHost,
         checkout_root: Path,
         *,
         osv: OsvClient | None = None,
@@ -243,6 +244,9 @@ def discover_dependencies(root: Path, stats: ScanStats) -> Iterator[DiscoveredDe
             dependencies = adapter.parse_dependencies(text)
         except (OSError, UnicodeDecodeError) as exc:
             _record_manifest_gap(stats, relative, f"cannot read: {exc}")
+            continue
+        except UnparsableManifest as exc:
+            _record_manifest_gap(stats, relative, f"not a dependency structure we recognise: {exc}")
             continue
         except RecursionError:
             _record_manifest_gap(stats, relative, "is nested too deeply to parse")

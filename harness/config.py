@@ -81,6 +81,13 @@ class ModelConfig:
     Stages request a size chosen against one vendor's limits; a model with a lower output
     cap rejects the call rather than truncating it, so the value is configurable per role.
     """
+    pricing: tuple[float, float] | None = None
+    """Cost per million tokens as ``(input, output)``, for models outside the built-in table.
+
+    Declared rather than inferred. A vendor's rates change without notice, and a stale or
+    invented figure inside a safety mechanism is worse than a missing one: an unpriced
+    model is reported as unpriced, which is loud, while a wrong price is not.
+    """
 
     @property
     def max_context_tokens(self) -> int:
@@ -164,6 +171,23 @@ def _require(mapping: dict[str, Any], key: str, where: str) -> Any:
     return mapping[key]
 
 
+def _pricing(node: Any) -> tuple[float, float] | None:
+    """Parse a role's declared rates. Both halves are required or neither is used."""
+    if node is None:
+        return None
+    if not isinstance(node, dict):
+        raise ConfigError("models.<role>.pricing must be a mapping")
+    missing = [
+        key for key in ("input_per_mtok", "output_per_mtok") if node.get(key) is None
+    ]
+    if missing:
+        raise ConfigError(
+            f"models.<role>.pricing is missing {', '.join(missing)}; a half-declared "
+            "price would understate spend and quietly relax a budget cap"
+        )
+    return (float(node["input_per_mtok"]), float(node["output_per_mtok"]))
+
+
 def load_config(
     path: str | Path = "config/harness.yaml", *, require_github_auth: bool = True
 ) -> HarnessConfig:
@@ -215,6 +239,7 @@ def load_config(
             max_output_tokens=(
                 int(spec["max_output_tokens"]) if spec.get("max_output_tokens") else None
             ),
+            pricing=_pricing(spec.get("pricing")),
         )
 
     budgets_raw = _require(raw, "budgets", str(path))
