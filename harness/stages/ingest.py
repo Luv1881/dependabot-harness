@@ -302,7 +302,21 @@ class IngestStage:
         text = self._manifest(raw.repo, raw.manifest_path, commit_sha)
         if text is None:
             return ScopeResult(Scope.UNKNOWN, None, "manifest-unreadable")
-        return adapter.resolve_scope(text, raw.package_name)
+        try:
+            return adapter.resolve_scope(text, raw.package_name)
+        except Exception as exc:
+            # An unparsable manifest yields an unknown scope, never a runtime one, and
+            # never an aborted run. A manifest is untrusted input from a repository the
+            # operator does not control, so a hostile or merely exotic document must not
+            # be able to stop ingest for the whole fleet.
+            log.warning(
+                "%s: cannot resolve scope from %s: %s: %s",
+                raw.repo,
+                raw.manifest_path,
+                type(exc).__name__,
+                exc,
+            )
+            return ScopeResult(Scope.UNKNOWN, None, "manifest-unparsable")
 
     def _manifest(self, repo: str, path: str, ref: str) -> str | None:
         cache_key = (repo, path, ref)

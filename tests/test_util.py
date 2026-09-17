@@ -9,6 +9,7 @@ from harness.util import (
     alert_key,
     canonical_json,
     matches_any,
+    purl_package_name,
     retry_with_backoff,
     sha256_hex,
 )
@@ -140,3 +141,95 @@ class TestRetry:
             )
         assert all(0 <= d <= 10.0 for d in delays)
         assert len(set(delays)) > 1
+
+
+class TestRetryIfNarrowsRetryability:
+    """`retry_on` selects by type; `retry_if` lets an error that carries its own verdict
+    opt out. Without it every `ModelError` retries, including permanent ones."""
+
+    def test_a_rejected_error_is_raised_unchanged_and_not_retried(self) -> None:
+        calls = 0
+
+        def fn() -> str:
+            nonlocal calls
+            calls += 1
+            raise ValueError("permanent")
+
+        with pytest.raises(ValueError, match="permanent"):
+            retry_with_backoff(
+                fn,
+                attempts=5,
+                retry_on=(ValueError,),
+                retry_if=lambda exc: exc.args[0] != "permanent",
+                sleep=lambda _: None,
+            )
+        assert calls == 1
+
+    def test_an_accepted_error_still_retries(self) -> None:
+        calls = 0
+
+        def fn() -> str:
+            nonlocal calls
+            calls += 1
+            raise ValueError("transient")
+
+        with pytest.raises(RetryExhausted):
+            retry_with_backoff(
+                fn,
+                attempts=3,
+                retry_on=(ValueError,),
+                retry_if=lambda exc: exc.args[0] != "permanent",
+                sleep=lambda _: None,
+            )
+        assert calls == 3
+
+    def test_the_rejected_error_keeps_its_own_type_not_retry_exhausted(self) -> None:
+        """A permanent failure reported as `RetryExhausted` names nothing an operator can act on."""
+
+        class ConfigError(Exception):
+            pass
+
+        def fn() -> str:
+            raise ConfigError("set ANTHROPIC_API_KEY")
+
+        with pytest.raises(ConfigError, match="set ANTHROPIC_API_KEY"):
+            retry_with_backoff(
+                fn,
+                attempts=3,
+                retry_on=(ConfigError,),
+                retry_if=lambda _: False,
+                sleep=lambda _: None,
+            )
+
+
+class TestPurlPackageName:
+    """A coordinate that still carries a version matches no import, and a rule that reads
+    'matches no import' as 'never imported' would clear a live vulnerability."""
+
+    @pytest.mark.parametrize(
+        ("purl", "expected"),
+        [
+            ("pkg:npm/lodash", "lodash"),
+            ("pkg:npm/lodash@4.17.21", "lodash"),
+            ("pkg:npm/@scope/name", "@scope/name"),
+            ("pkg:npm/@scope/name@1.2.3", "@scope/name"),
+            ("pkg:npm/@scope/name@1.2.3?arch=x", "@scope/name"),
+            ("pkg:npm/@scope/name#sub/path", "@scope/name"),
+            ("pkg:pypi/pyarrow", "pyarrow"),
+            ("pkg:pypi/Flask@2.0.1", "Flask"),
+            (
+                "pkg:golang/github.com/prometheus/prometheus",
+                "github.com/prometheus/prometheus",
+            ),
+            (
+                "pkg:maven/com.fasterxml.core/jackson-databind",
+                "com.fasterxml.core/jackson-databind",
+            ),
+        ],
+    )
+    def test_coordinate_is_extracted(self, purl: str, expected: str) -> None:
+        assert purl_package_name(purl) == expected
+
+    @pytest.mark.parametrize("purl", ["", "garbage", "pkg:npm", ":", "/only"])
+    def test_a_malformed_purl_yields_nothing_rather_than_a_wrong_name(self, purl: str) -> None:
+        assert purl_package_name(purl) == ""

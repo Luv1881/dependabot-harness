@@ -13,6 +13,8 @@ from collections.abc import Iterator
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from ..fsutil import iter_repo_files
+
 _MAX_FILE_BYTES = 2_000_000
 _SKIP_DIRS = frozenset(
     {
@@ -93,14 +95,7 @@ class ImportScanner(ABC):
         return ImportIndex(scanned=True, modules=modules, files_scanned=count)
 
     def _iter_files(self, root: Path) -> Iterator[Path]:
-        for path in root.rglob("*"):
-            if not path.is_file():
-                continue
-            if any(part in _SKIP_DIRS for part in path.parts):
-                continue
-            if self.extensions and path.suffix not in self.extensions:
-                continue
-            yield path
+        return iter_repo_files(root, skip_dirs=_SKIP_DIRS, suffixes=self.extensions)
 
 
 class GoImportScanner(ImportScanner):

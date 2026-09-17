@@ -8,11 +8,23 @@ implementation fails loudly rather than silently returning "not reachable".
 
 from __future__ import annotations
 
+import re
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from enum import IntEnum
 from pathlib import Path
 from typing import Any
+
+_VERSION_LIKE = re.compile(r"^[vV]?\d[\w.+-]*$")
+"""A leading numeric component, optionally `v`-prefixed, then only version characters.
+
+``1.2.3``, ``v1.2.3``, ``2026.1``, ``1.0.0-rc.1+build`` all pass. ``latest``,
+``file:../x``, ``git+https://…``, ``npm:other@1.0.0`` and ``*`` all fail, because none
+of them can be matched against an affected-version range.
+"""
+
+_WILDCARD_COMPONENT = re.compile(r"^[xX*]$")
+"""`2.x` and `1.2.x` look version-shaped but are ranges, not pins."""
 
 GITHUB_ECOSYSTEM_ALIASES = {
     "go": "go",
@@ -72,8 +84,20 @@ class Dependency:
 
     @property
     def is_pinned(self) -> bool:
-        """Whether the version is exact enough to query an advisory database with."""
-        return bool(self.version) and not any(c in self.version for c in "^~><*=| ")
+        """Whether the version is exact enough to query an advisory database with.
+
+        A version must look like a version. Lockfiles and manifests also carry non-version
+        references — ``latest``, ``file:../pkg``, ``git+https://…``, ``npm:other@1.0.0``
+        — and querying an advisory database for those returns nothing, which is then
+        counted as 'checked and clean'. Treating an unanswerable query as a clean answer
+        is precisely the confusion this harness exists to prevent, so those are excluded
+        here and reported as skipped instead.
+        """
+        if not _VERSION_LIKE.match(self.version):
+            return False
+        return not any(
+            _WILDCARD_COMPONENT.match(part) for part in re.split(r"[.\-+]", self.version)
+        )
 
 
 @dataclass(frozen=True)

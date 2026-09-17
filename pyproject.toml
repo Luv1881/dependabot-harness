@@ -13,6 +13,12 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = ["pytest>=8.0", "ruff>=0.6", "mypy>=1.11", "types-PyYAML", "cvss>=3.1"]
+# Provider SDKs are imported lazily and are deliberately not hard dependencies: the
+# deterministic half of the pipeline, the eval harness, and scan-public all run without
+# one installed. Install the one your config's `models.*.provider` names.
+anthropic = ["anthropic>=0.40"]
+openai = ["openai>=1.40"]
+agents = ["anthropic>=0.40", "openai>=1.40"]
 
 [project.scripts]
 harness = "harness.cli:main"

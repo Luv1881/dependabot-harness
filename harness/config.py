@@ -18,6 +18,23 @@ from .util import config_hash
 
 _ENV_PATTERN = re.compile(r"\$\{([A-Z0-9_]+)\}")
 
+REPO_PATTERN = re.compile(r"^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$")
+"""GitHub `owner/name`. Every value accepted here is later interpolated into an API
+path, a clone URL, and a filesystem path, so the charset is constrained once, here,
+rather than at each of those three sinks."""
+
+
+def valid_repo(repo: str) -> bool:
+    """Whether ``repo`` is a safe ``owner/name``.
+
+    The character check alone is not sufficient: ``owner/..`` matches it, and a ``..``
+    segment is exactly what makes a URL or a directory join climb out of its tree.
+    """
+    if not REPO_PATTERN.match(repo):
+        return False
+    return all(part not in {".", ".."} for part in repo.split("/"))
+
+
 _SECRET_KEYS = frozenset({"app_id", "installation_id", "private_key_path", "token"})
 
 
@@ -154,8 +171,11 @@ def load_config(path: str | Path = "config/harness.yaml") -> HarnessConfig:
     if not repos:
         raise ConfigError("github.repos: explicit allowlist is required (no wildcard discovery)")
     for repo in repos:
-        if repo.count("/") != 1:
-            raise ConfigError(f"github.repos: {repo!r} must be 'owner/name'")
+        if not valid_repo(repo):
+            raise ConfigError(
+                f"github.repos: {repo!r} must be 'owner/name' using letters, digits, "
+                "'.', '_' or '-', with no path segments and no query characters"
+            )
     github = GithubConfig(
         org=_require(gh, "org", "github"),
         repos=repos,

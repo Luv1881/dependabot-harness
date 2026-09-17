@@ -6,16 +6,26 @@ checkout root; a path that escapes it is refused rather than resolved.
 
 from __future__ import annotations
 
+import fnmatch
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from ..fsutil import iter_repo_files
 from ..sources.osv import OsvClient
 
 MAX_READ_LINES = 200
 MAX_GREP_MATCHES = 40
 MAX_GREP_FILES = 2000
+MAX_FILE_BYTES = 2_000_000
+"""Largest file any tool will load. A checkout is untrusted input, and a hostile repo
+can contain a multi-gigabyte file purely to exhaust memory before a single line is read."""
+
+MAX_GREP_BYTES = 8_000_000
+"""Total bytes one grep call may load across every file it visits."""
+
+_ADVISORY_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 _SKIP_DIRS = frozenset({".git", "node_modules", "vendor", "target", "dist", ".venv"})
 
 
@@ -121,6 +131,15 @@ class Toolbox:
             return "error: path is outside the repository"
         if not target.is_file():
             return f"error: no such file: {arguments.get('path')}"
+        try:
+            size = target.stat().st_size
+        except OSError as exc:
+            return f"error: cannot stat {arguments.get('path')}: {exc}"
+        if size > MAX_FILE_BYTES:
+            return (
+                f"error: {arguments.get('path')} is {size} bytes, above the "
+                f"{MAX_FILE_BYTES}-byte read limit"
+            )
 
         lines = target.read_text(encoding="utf-8", errors="replace").splitlines()
         start = max(1, int(arguments.get("start") or 1))
@@ -132,6 +151,14 @@ class Toolbox:
         return f"{arguments.get('path')} lines {start}-{end}:\n{body}"
 
     def _grep(self, arguments: dict[str, Any]) -> str:
+        """Search the checkout, never outside it.
+
+        The glob is model-controlled and the model reads an untrusted repository, so the
+        walk is confined by construction: the directory walk does not follow symlinks and
+        every candidate file is resolved and re-checked against the checkout root before
+        it is opened. A pattern that tries to climb out with ``..`` is refused outright
+        rather than normalised, because normalising it is what would make it work.
+        """
         if self.repo_root is None:
             return "error: no checkout available"
         try:
@@ -140,19 +167,29 @@ class Toolbox:
             return f"error: invalid regular expression: {exc}"
 
         glob = str(arguments.get("glob") or "*")
+        if _escapes(glob):
+            return "error: glob must stay within the repository"
+
         matches: list[str] = []
         scanned = 0
-        for path in sorted(self.repo_root.rglob(glob)):
-            if scanned >= MAX_GREP_FILES or len(matches) >= MAX_GREP_MATCHES:
+        budget = MAX_GREP_BYTES
+        for path in iter_repo_files(self.repo_root, skip_dirs=_SKIP_DIRS):
+            if scanned >= MAX_GREP_FILES or len(matches) >= MAX_GREP_MATCHES or budget <= 0:
                 break
-            if not path.is_file() or any(part in _SKIP_DIRS for part in path.parts):
+            relative = path.relative_to(self.repo_root)
+            if not _matches_glob(str(relative), glob):
+                continue
+            if self._resolve(str(relative)) is None:
                 continue
             scanned += 1
             try:
+                size = path.stat().st_size
+                if size > MAX_FILE_BYTES:
+                    continue
                 text = path.read_text(encoding="utf-8", errors="replace")
             except OSError:
                 continue
-            relative = path.relative_to(self.repo_root)
+            budget -= size
             for number, line in enumerate(text.splitlines(), start=1):
                 if pattern.search(line):
                     matches.append(f"{relative}:{number}: {line.strip()[:200]}")
@@ -165,9 +202,12 @@ class Toolbox:
     def _fetch_advisory(self, arguments: dict[str, Any]) -> str:
         if self.osv is None:
             return "error: advisory lookup unavailable"
-        advisory = self.osv.fetch(str(arguments.get("id", "")))
+        vuln_id = str(arguments.get("id", "")).strip()
+        if not _ADVISORY_ID.match(vuln_id):
+            return "error: advisory id must be a bare identifier such as GHSA-xxxx-yyyy-zzzz"
+        advisory = self.osv.fetch(vuln_id)
         if advisory is None:
-            return f"no advisory found for {arguments.get('id')}"
+            return f"no advisory found for {vuln_id}"
         return (
             f"{advisory.ghsa_id}: {advisory.summary}\n"
             f"aliases: {', '.join(advisory.aliases) or 'none'}\n"
@@ -187,3 +227,16 @@ class Toolbox:
 
     def audit(self) -> list[dict[str, Any]]:
         return [{"tool": c.name, "arguments": c.arguments, "error": c.error} for c in self.calls]
+
+
+def _escapes(glob: str) -> bool:
+    """Whether a glob tries to leave the repository."""
+    text = glob.strip()
+    if not text or text.startswith("~") or Path(text).is_absolute():
+        return True
+    return ".." in Path(text).parts
+
+
+def _matches_glob(relative: str, glob: str) -> bool:
+    """Glob semantics that match ``Path.rglob``: a bare pattern matches at any depth."""
+    return fnmatch.fnmatch(relative, glob) or fnmatch.fnmatch(relative, f"**/{glob}")

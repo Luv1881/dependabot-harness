@@ -19,6 +19,30 @@ def sha256_hex(*parts: str) -> str:
     return hashlib.sha256("|".join(parts).encode()).hexdigest()
 
 
+def purl_package_name(purl: str) -> str:
+    """The package coordinate from a PURL, without version, qualifiers or subpath.
+
+    ``pkg:npm/@scope/name@1.2.3?arch=x#sub`` becomes ``@scope/name``.
+
+    The version is stripped because callers compare this against an index of import
+    identifiers. A coordinate that still carries ``@1.2.3`` matches nothing, and a rule
+    that reads 'matches nothing' as 'never imported' would clear a live vulnerability.
+    A leading ``@`` is a scope, not a version separator, so only an ``@`` occurring after
+    the final ``/`` is treated as one.
+
+    Returns ``""`` for a string that is not shaped like a PURL at all, which callers must
+    treat as undecidable rather than as a package that is absent.
+    """
+    body = purl.split(":", 1)[1] if ":" in purl else purl
+    body = body.split("#", 1)[0].split("?", 1)[0]
+    head, _, path = body.partition("/")
+    if not head or not path:
+        return ""
+    if "@" in path.rpartition("/")[2]:
+        path = path.rsplit("@", 1)[0]
+    return path
+
+
 def alert_key(
     *, ghsa_id: str, purl: str, resolved_version: str | None, manifest_path: str, repo: str
 ) -> str:
@@ -80,11 +104,17 @@ def retry_with_backoff(
     base_delay: float = 1.0,
     max_delay: float = 60.0,
     retry_on: tuple[type[BaseException], ...] = (Exception,),
+    retry_if: Callable[[BaseException], bool] | None = None,
     on_retry: Callable[[int, float, BaseException], None] | None = None,
     sleep: Callable[[float], None] = time.sleep,
     rng: random.Random | None = None,
 ) -> T:
     """Exponential backoff with full jitter.
+
+    ``retry_on`` selects by exception type; ``retry_if`` narrows further for errors that
+    carry their own retryability verdict. An exception that ``retry_if`` rejects is
+    re-raised unchanged rather than wrapped, so a permanent failure keeps its own type
+    and message instead of being flattened into a generic exhaustion error.
 
     Callers persist progress *before* invoking this, so an exhausted retry costs the
     in-flight task and nothing else.
@@ -95,6 +125,8 @@ def retry_with_backoff(
         try:
             return fn()
         except retry_on as exc:
+            if retry_if is not None and not retry_if(exc):
+                raise
             last = exc
             if attempt == attempts - 1:
                 break

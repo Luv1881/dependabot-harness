@@ -78,13 +78,41 @@ reliable ecosystem, and it must never produce a high-confidence `not_affected`.
 ```bash
 python -m venv .venv && .venv/bin/pip install -e ".[dev]"
 
-export GH_TOKEN=...                      # or GH_APP_ID + GH_INSTALLATION_ID + GH_PRIVATE_KEY_PATH
-export ANTHROPIC_API_KEY=...             # only needed for the agent stages
+# The agent stages need the SDK for whichever provider your config names.
+.venv/bin/pip install -e ".[anthropic]"        # or ".[openai]" / ".[agents]"
 
-harness run                              # full pipeline over config/harness.yaml
-harness resume --run-id <id>             # continue, redoing nothing completed
-harness report                           # metrics for the latest run
+cp .env.example .env && "$EDITOR" .env         # fill in GH_TOKEN and a model key
+set -a; . ./.env; set +a                       # export them into this shell
+
+harness run                                    # full pipeline over config/harness.yaml
+harness resume --run-id <id>                   # continue, redoing nothing completed
+harness report                                 # metrics for the latest run
 ```
+
+### Where credentials go
+
+The harness reads the **process environment** and nothing else. It never parses `.env`,
+never writes a secret to SQLite, and never logs one; `config_hash` is computed over the
+config with secret-bearing keys stripped, so rotating a token does not invalidate a run.
+
+| Variable | Needed for | Notes |
+|---|---|---|
+| `GH_TOKEN` | `run`, `scan-public` | or the three `GH_APP_*` variables below |
+| `GH_APP_ID` + `GH_INSTALLATION_ID` + `GH_PRIVATE_KEY_PATH` | `run`, `scan-public` | preferred for a fleet; takes precedence over `GH_TOKEN` |
+| `ANTHROPIC_API_KEY` | agent stages | when `models.*.provider: anthropic` |
+| `OPENAI_API_KEY` | agent stages | when `models.*.provider: openai` |
+
+The model key is matched to the provider named in `config/harness.yaml`. `harness run`
+checks for it **before** the first stage and exits 3 naming the variable to set, rather
+than failing after ingest has already run. `scan-public` enables the agent stages only
+when the keys they need are present, so the deterministic half stays free:
+
+```bash
+harness scan-public --repo golang/go --agents off    # GH_TOKEN only, $0.00
+python eval/run_eval.py --allow-synthetic            # no credentials at all
+```
+
+`.env` is git-ignored, along with `*.pem`. Copy `.env.example` to start.
 
 ### Scanning a public repository without Dependabot access
 
@@ -123,6 +151,18 @@ Run end to end against [prometheus/prometheus](https://github.com/prometheus/pro
 [apache/airflow](https://github.com/apache/airflow) — neither administered by the
 operator, both at $0.00 model spend. Six defects surfaced that no synthetic fixture had
 caught. Full results and the bug list: [`docs/validation.md`](docs/validation.md).
+
+## Security posture
+
+The harness clones and parses source from repositories it does not administer, and treats
+model output as untrusted input to the only write that closes an alert. A full audit
+against that threat model — thirteen findings, each fixed and pinned by a test — is
+recorded in [`docs/hardening.md`](docs/hardening.md).
+
+The short version: the agent's tool surface is confined to the checkout and cannot be
+walked out of by a crafted glob, a symlink, or a `..` path; a GitHub token is never
+written to disk; a toolchain failure is never recorded as a clearance; and a permanent
+configuration error is never retried as a transient one.
 
 ## Verified against real tooling
 

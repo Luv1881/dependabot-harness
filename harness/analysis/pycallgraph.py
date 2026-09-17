@@ -11,6 +11,8 @@ import ast
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from ..fsutil import iter_repo_files
+
 _SKIP_DIRS = frozenset(
     {".git", ".venv", "venv", "__pycache__", "node_modules", "build", "dist", ".tox"}
 )
@@ -83,9 +85,7 @@ def analyze(root: Path) -> PythonAnalysis:
     if not root.is_dir():
         return analysis
 
-    for path in sorted(root.rglob("*.py")):
-        if any(part in _SKIP_DIRS for part in path.parts):
-            continue
+    for path in iter_repo_files(root, skip_dirs=_SKIP_DIRS, suffixes=(".py",)):
         try:
             source = path.read_text(encoding="utf-8", errors="replace")
             tree = ast.parse(source, filename=str(path))

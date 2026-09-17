@@ -8,8 +8,9 @@ from .client import (
     ModelRequest,
     ModelResponse,
     build_provider,
+    required_api_key_env,
 )
-from .errors import Classification, ModelError, ResponseClass, classify
+from .errors import Classification, ModelError, ProviderConfigurationError, ResponseClass, classify
 
 __all__ = [
     "BudgetDecision",
@@ -22,9 +23,11 @@ __all__ = [
     "ModelProvider",
     "ModelRequest",
     "ModelResponse",
+    "ProviderConfigurationError",
     "ResponseClass",
     "Usage",
     "build_provider",
     "classify",
     "price",
+    "required_api_key_env",
 ]

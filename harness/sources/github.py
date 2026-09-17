@@ -14,6 +14,7 @@ from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+from urllib.parse import quote
 
 import httpx
 
@@ -215,8 +216,17 @@ class GithubClient:
         return sha256_hex(*(f"{path}:{oid}" for path, oid in entries))
 
     def file_text(self, repo: str, path: str, ref: str) -> str | None:
-        """Fetch one file's contents. Returns None for a missing path."""
-        resp = self._request("GET", f"{API}/repos/{repo}/contents/{path}", params={"ref": ref})
+        """Fetch one file's contents. Returns None for a missing path.
+
+        ``path`` arrives from Dependabot's ``vulnerableManifestPath`` or from a local
+        checkout, and it is interpolated into a request URL that carries the operator's
+        credentials. A ``..`` segment or a query character would retarget that request,
+        so each segment is percent-encoded and traversal is refused outright.
+        """
+        if _escapes_repo_path(path):
+            raise GithubError(f"contents {repo}: refusing path {path!r}")
+        quoted = quote(path, safe="/")
+        resp = self._request("GET", f"{API}/repos/{repo}/contents/{quoted}", params={"ref": ref})
         if resp.status_code == 404:
             return None
         if resp.status_code >= 400:
@@ -239,6 +249,13 @@ class GithubClient:
         )
         if resp.status_code >= 400:
             raise GithubError(f"dismiss {repo}#{number}: {resp.status_code} {resp.text[:200]}")
+
+
+def _escapes_repo_path(path: str) -> bool:
+    """Whether a repository-relative path tries to leave the repository."""
+    if not path or path.startswith("/") or "\\" in path:
+        return True
+    return ".." in path.split("/")
 
 
 def _parse_alert(repo: str, node: dict[str, Any]) -> RawAlert:

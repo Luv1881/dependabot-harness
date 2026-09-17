@@ -23,6 +23,7 @@ class ResponseClass(StrEnum):
     REFUSAL = "refusal"
     TRUNCATED = "truncated"
     MALFORMED = "malformed"
+    CONFIG = "config"
 
     @property
     def is_retryable(self) -> bool:
@@ -71,6 +72,53 @@ class ModelError(RuntimeError):
     @property
     def is_retryable(self) -> bool:
         return self.classification.is_retryable
+
+
+class ProviderConfigurationError(ModelError):
+    """The provider cannot be used at all until configuration is fixed.
+
+    Distinct from a transient failure because retrying does not help: an unset API key,
+    an invalid one rejected with 401, or an SDK that is not installed will fail the same
+    way on the third attempt as on the first. Reporting those as `RetryExhausted` hides
+    the one fact the operator needs.
+    """
+
+    def __init__(self, message: str) -> None:
+        super().__init__(message, ResponseClass.CONFIG)
+
+
+_PERMANENT_PROVIDER_STATUS = frozenset({400, 401, 403, 404, 422})
+
+_PERMANENT_PROVIDER_ERRORS = frozenset(
+    {
+        # Anthropic SDK
+        "AuthenticationError",
+        "PermissionDeniedError",
+        "NotFoundError",
+        "BadRequestError",
+        "UnprocessableEntityError",
+        "AnthropicError",
+        # OpenAI SDK
+        "OpenAIError",
+        # Raised by either SDK's constructor when no credential can be resolved.
+        "TypeError",
+    }
+)
+
+
+def is_permanent_provider_error(exc: BaseException) -> bool:
+    """Whether an exception from a provider SDK can be fixed by retrying.
+
+    SDK types are matched by name rather than by import so that neither vendor package
+    has to be installed for this module to load — the harness imports them lazily, and
+    an operator may legitimately have only one of them.
+    """
+    if isinstance(exc, (ModuleNotFoundError, ImportError)):
+        return True
+    if type(exc).__name__ in _PERMANENT_PROVIDER_ERRORS:
+        return True
+    status = getattr(exc, "status_code", None)
+    return isinstance(status, int) and status in _PERMANENT_PROVIDER_STATUS
 
 
 @dataclass(frozen=True)

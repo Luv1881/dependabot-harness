@@ -23,6 +23,7 @@ import httpx
 from ..cvss import parse_vector
 from ..ecosystems import get_adapter
 from ..ecosystems.base import Dependency
+from ..fsutil import iter_repo_files
 from ..util import retry_with_backoff
 from ..versions import Version, try_parse
 from .github import GithubClient, RawAlert
@@ -206,29 +207,54 @@ class OsvAlertSource:
 
 
 def discover_dependencies(root: Path, stats: ScanStats) -> Iterator[DiscoveredDependency]:
-    """Walk a checkout for recognised manifests and read their pinned dependencies."""
+    """Walk a checkout for recognised manifests and read their pinned dependencies.
+
+    Every manifest that cannot be read, parsed, or is too large to load is recorded as a
+    coverage gap rather than skipped. Silently skipping one leaves the run reporting
+    complete coverage over a lockfile that nobody ever examined, which is the same
+    mistake as reporting a failed toolchain as 'not reachable'.
+    """
     if not root.is_dir():
         return
 
-    for path in sorted(root.rglob("*")):
-        if not path.is_file() or any(part in _SKIP_DIRS for part in path.parts):
-            continue
-        ecosystem = MANIFESTS.get(path.name)
-        if ecosystem is None:
-            continue
+    for path in _iter_manifests(root):
+        ecosystem = MANIFESTS[path.name]
+        relative = str(path.relative_to(root))
         adapter = get_adapter(ecosystem)
         if adapter is None:
+            _record_manifest_gap(stats, relative, f"no adapter for ecosystem {ecosystem!r}")
             continue
+
         try:
-            if path.stat().st_size > _MAX_MANIFEST_BYTES:
-                continue
+            size = path.stat().st_size
+        except OSError as exc:
+            _record_manifest_gap(stats, relative, f"cannot stat: {exc}")
+            continue
+        if size > _MAX_MANIFEST_BYTES:
+            _record_manifest_gap(
+                stats,
+                relative,
+                f"is {size} bytes, above the {_MAX_MANIFEST_BYTES}-byte limit",
+            )
+            continue
+
+        try:
             text = path.read_text(encoding="utf-8", errors="replace")
-        except OSError:
+            dependencies = adapter.parse_dependencies(text)
+        except (OSError, UnicodeDecodeError) as exc:
+            _record_manifest_gap(stats, relative, f"cannot read: {exc}")
+            continue
+        except RecursionError:
+            _record_manifest_gap(stats, relative, "is nested too deeply to parse")
+            continue
+        except Exception as exc:
+            _record_manifest_gap(
+                stats, relative, f"failed to parse: {type(exc).__name__}: {exc}"
+            )
             continue
 
         stats.manifests += 1
-        relative = str(path.relative_to(root))
-        for dependency in adapter.parse_dependencies(text):
+        for dependency in dependencies:
             stats.dependencies += 1
             if not dependency.is_pinned:
                 stats.unpinned_skipped += 1
@@ -236,6 +262,24 @@ def discover_dependencies(root: Path, stats: ScanStats) -> Iterator[DiscoveredDe
             yield DiscoveredDependency(
                 dependency=dependency, ecosystem=ecosystem, manifest_path=relative
             )
+
+
+def _iter_manifests(root: Path) -> Iterator[Path]:
+    """Recognised manifests under ``root``, without following directory symlinks.
+
+    Skipped directories are pruned rather than filtered afterwards, so a nested
+    ``node_modules`` is never walked at all.
+    """
+    for path in iter_repo_files(root, skip_dirs=_SKIP_DIRS):
+        if path.name in MANIFESTS:
+            yield path
+
+
+def _record_manifest_gap(stats: ScanStats, relative: str, reason: str) -> None:
+    stats.errors.append(
+        f"{relative}: {reason}; its dependencies were never checked and their status is unknown"
+    )
+    log.warning("manifest not checked: %s: %s", relative, reason)
 
 
 def _to_raw_alert(repo: str, found: DiscoveredDependency, advisory: Any, number: int) -> RawAlert:

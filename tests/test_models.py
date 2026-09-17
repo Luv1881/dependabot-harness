@@ -14,10 +14,13 @@ from harness.models import (
     ModelError,
     ModelRequest,
     ModelResponse,
+    ProviderConfigurationError,
     ResponseClass,
     Usage,
+    build_provider,
     classify,
     price,
+    required_api_key_env,
 )
 from harness.models.client import ContextCeilingExceeded
 from harness.util import RetryExhausted
@@ -343,6 +346,95 @@ class TestProviderExceptionHandling:
         client = ModelClient(model_cfg(), ledger, provider=Broken(), max_attempts=2)
         with pytest.raises(RetryExhausted):
             client.complete(ModelRequest(system="s", user="u"), repo="org/a", stage="recon")
+
+
+class TestPermanentProviderErrorsAreNotRetried:
+    """A missing key, a rejected key, or an absent SDK fails identically on the third
+    attempt. Retrying it turns a one-line configuration error into a `RetryExhausted`
+    that names nothing, and the operator learns only that something went wrong."""
+
+    def test_a_401_from_the_provider_is_not_retried(self, db: Database) -> None:
+        class Rejected(Exception):
+            status_code = 401
+
+        class Denied:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def complete(self, request: ModelRequest, model: str) -> ModelResponse:
+                self.calls += 1
+                raise Rejected("invalid x-api-key")
+
+        provider = Denied()
+        ledger = BudgetLedger(budget_cfg(), db, "run1")
+        client = ModelClient(model_cfg(), ledger, provider=provider, max_attempts=3)
+        with pytest.raises(ProviderConfigurationError, match="invalid x-api-key"):
+            client.complete(ModelRequest(system="s", user="u"), repo="org/a", stage="recon")
+        assert provider.calls == 1
+
+    def test_a_missing_sdk_is_a_configuration_error_not_an_exhausted_retry(
+        self, db: Database
+    ) -> None:
+        class NoSdk:
+            def complete(self, request: ModelRequest, model: str) -> ModelResponse:
+                raise ModuleNotFoundError("No module named 'anthropic'")
+
+        ledger = BudgetLedger(budget_cfg(), db, "run1")
+        client = ModelClient(
+            model_cfg(provider="anthropic"), ledger, provider=NoSdk(), max_attempts=3
+        )
+        with pytest.raises(ProviderConfigurationError, match="pip install anthropic"):
+            client.complete(ModelRequest(system="s", user="u"), repo="org/a", stage="recon")
+
+    def test_a_configuration_error_is_marked_non_retryable(self) -> None:
+        error = ProviderConfigurationError("set ANTHROPIC_API_KEY")
+        assert error.is_retryable is False
+        assert error.classification is ResponseClass.CONFIG
+
+    def test_a_connection_reset_is_still_transient(self, db: Database) -> None:
+        class Flaky:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def complete(self, request: ModelRequest, model: str) -> ModelResponse:
+                self.calls += 1
+                if self.calls == 1:
+                    raise ConnectionError("connection reset by peer")
+                return ok()
+
+        provider = Flaky()
+        ledger = BudgetLedger(budget_cfg(), db, "run1")
+        client = ModelClient(model_cfg(), ledger, provider=provider)
+        assert client.complete(
+            ModelRequest(system="s", user="u"), repo="org/a", stage="recon"
+        ).is_usable
+        assert provider.calls == 2
+
+
+class TestProviderCredentialsAreCheckedBeforeUse:
+    def test_an_unset_key_names_the_variable_to_set(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+        with pytest.raises(ProviderConfigurationError, match="ANTHROPIC_API_KEY"):
+            build_provider("anthropic")
+
+    def test_a_set_key_constructs_the_provider_without_importing_the_sdk(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Constructing the provider must not require the vendor package: the SDK import
+        is deferred until the first call so an unused provider costs nothing."""
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-test-value")
+        provider = build_provider("anthropic")
+        assert provider.name == "anthropic"
+        assert provider._api_key == "sk-test-value"
+
+    def test_each_provider_maps_to_its_own_environment_variable(self) -> None:
+        assert required_api_key_env("anthropic") == "ANTHROPIC_API_KEY"
+        assert required_api_key_env("openai") == "OPENAI_API_KEY"
+        assert required_api_key_env("unknown-vendor") is None
+
+    def test_an_unknown_provider_is_still_a_plain_value_error(self) -> None:
+        with pytest.raises(ValueError, match="unknown model provider"):
+            build_provider("nonexistent")
 
 
 class TestContextEstimateIsPessimistic:

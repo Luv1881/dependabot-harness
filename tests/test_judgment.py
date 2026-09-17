@@ -6,7 +6,7 @@ from typing import Any
 
 import pytest
 
-from harness.agents.toolbox import TOOL_DEFINITIONS, Toolbox
+from harness.agents.toolbox import MAX_FILE_BYTES, TOOL_DEFINITIONS, Toolbox
 from harness.config import HarnessConfig, load_config
 from harness.db import AlertRecord, Database
 from harness.models import BudgetLedger, ModelClient, ModelRequest, ModelResponse, Usage
@@ -244,6 +244,88 @@ class TestToolbox:
         box = Toolbox(repo_root=tmp_path)
         box.dispatch("grep", {"pattern": "x"})
         assert box.audit()[0]["tool"] == "grep"
+
+    @pytest.mark.parametrize(
+        "glob",
+        ["../*", "../*.txt", "**/../*.txt", "../../*", "/etc/*", "~/.*"],
+    )
+    def test_grep_refuses_globs_that_leave_the_checkout(
+        self, tmp_path: Path, glob: str
+    ) -> None:
+        """A traversal glob must be refused, not normalised into the path it names.
+
+        The glob is model-controlled and the model reads an untrusted repository, so a
+        prompt-injected README could otherwise walk the agent straight to an operator's
+        credentials file and launder the contents into the emitted verdict.
+        """
+        secret = tmp_path.parent / "outside-secret.txt"
+        secret.write_text("SECRET_TOKEN=leak")
+        box = Toolbox(repo_root=tmp_path)
+        out = box.dispatch("grep", {"pattern": "SECRET_TOKEN", "glob": glob})
+        assert "leak" not in out
+        assert "stay within the repository" in out
+
+    def test_grep_does_not_follow_a_symlink_out_of_the_checkout(self, tmp_path: Path) -> None:
+        secret = tmp_path.parent / "symlink-target.txt"
+        secret.write_text("SECRET_TOKEN=leak")
+        (tmp_path / "innocent.txt").symlink_to(secret)
+        box = Toolbox(repo_root=tmp_path)
+        out = box.dispatch("grep", {"pattern": "SECRET_TOKEN", "glob": "*.txt"})
+        assert "leak" not in out
+
+    def test_grep_does_not_descend_into_a_symlinked_directory(self, tmp_path: Path) -> None:
+        outside = tmp_path.parent / "outside-tree"
+        outside.mkdir(exist_ok=True)
+        (outside / "deep.txt").write_text("SECRET_TOKEN=leak")
+        (tmp_path / "linked").symlink_to(outside, target_is_directory=True)
+        box = Toolbox(repo_root=tmp_path)
+        out = box.dispatch("grep", {"pattern": "SECRET_TOKEN", "glob": "*"})
+        assert "leak" not in out
+
+    def test_grep_still_reaches_nested_files_with_a_bare_glob(self, tmp_path: Path) -> None:
+        """`rglob` semantics are preserved: a bare pattern matches at any depth."""
+        (tmp_path / "pkg" / "inner").mkdir(parents=True)
+        (tmp_path / "pkg" / "inner" / "a.go").write_text("package inner\nfunc Deep() {}\n")
+        box = Toolbox(repo_root=tmp_path)
+        assert "func Deep" in box.dispatch("grep", {"pattern": "func Deep", "glob": "*.go"})
+
+    def test_read_file_refuses_a_file_above_the_read_limit(self, tmp_path: Path) -> None:
+        """A hostile checkout can hold a multi-gigabyte file purely to exhaust memory."""
+        (tmp_path / "huge.txt").write_text("x" * (MAX_FILE_BYTES + 1))
+        box = Toolbox(repo_root=tmp_path)
+        out = box.dispatch("read_file", {"path": "huge.txt"})
+        assert "read limit" in out
+
+    def test_grep_skips_a_file_above_the_read_limit(self, tmp_path: Path) -> None:
+        (tmp_path / "huge.txt").write_text("SECRET_TOKEN=leak" + "x" * (MAX_FILE_BYTES + 1))
+        box = Toolbox(repo_root=tmp_path)
+        assert "leak" not in box.dispatch("grep", {"pattern": "SECRET_TOKEN", "glob": "*.txt"})
+
+    @pytest.mark.parametrize("vuln_id", ["../../../etc/passwd", "a/b", "?x=y", "", "x" * 200])
+    def test_fetch_advisory_rejects_an_id_that_is_not_an_identifier(
+        self, tmp_path: Path, vuln_id: str
+    ) -> None:
+        class StubOsv:
+            calls = 0
+
+            def fetch(self, ident: str) -> Any:
+                StubOsv.calls += 1
+                return None
+
+        box = Toolbox(repo_root=tmp_path, osv=StubOsv())  # type: ignore[arg-type]
+        out = box.dispatch("fetch_advisory", {"id": vuln_id})
+        assert "bare identifier" in out
+        assert StubOsv.calls == 0
+
+    def test_fetch_advisory_accepts_a_well_formed_id(self, tmp_path: Path) -> None:
+        class StubOsv:
+            def fetch(self, ident: str) -> Any:
+                return None
+
+        box = Toolbox(repo_root=tmp_path, osv=StubOsv())  # type: ignore[arg-type]
+        assert box.dispatch("fetch_advisory", {"id": "GHSA-aaaa-bbbb-cccc"}) == (
+            "no advisory found for GHSA-aaaa-bbbb-cccc"
+        )
 
 
 class TestJudgmentStage:

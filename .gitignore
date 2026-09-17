@@ -7,5 +7,14 @@ __pycache__/
 .ruff_cache/
 *.pyc
 
+# Credentials. `.env.example` is committed as a template; a real `.env` never is.
+# Nothing here is read by the harness at runtime — it reads the process environment —
+# but a key pasted into one of these files must not be able to reach a commit.
+.env
+.env.*
+!.env.example
+*.pem
+!tests/**/*.pem
+
 # Working notes, not part of the deliverable
 CLAUDE.md

@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Any
 
 from ..analysis.pycallgraph import analyze
+from ..util import purl_package_name
 from .base import (
     CallSite,
     Dependency,
@@ -193,9 +194,8 @@ def _run_command(args: list[str], *, cwd: Path, timeout: int | None = None) -> A
 
 
 def _package_from_purl(purl: str) -> str:
-    body = purl.split(":", 1)[1] if ":" in purl else purl
-    name = body.split("/", 1)[1] if "/" in body else body
-    return normalize(name)
+    """Python import identifier for a PURL's package name."""
+    return normalize(purl_package_name(purl))
 
 
 def _osv_called(payload: dict[str, Any], ghsa_id: str) -> bool:

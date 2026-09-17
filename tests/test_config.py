@@ -118,3 +118,39 @@ def test_env_interpolation_of_unset_var_is_none_not_literal(
     text = BASE.replace("org: my-org", "org: my-org\n  installation_id: ${GH_INSTALLATION_ID}")
     cfg = load_config(write(tmp_path, text))
     assert cfg.github.installation_id is None
+
+
+@pytest.mark.parametrize(
+    "repo",
+    [
+        "my-org/a/extra",
+        "../etc/passwd",
+        "my-org/a?x=1",
+        "my-org/a#frag",
+        "my-org/a b",
+        "my-org/..",
+        "my-org/.",
+        "../..",
+        "/absolute",
+        "my-org/sub\\path",
+    ],
+)
+def test_a_repo_name_that_is_not_owner_slash_name_is_rejected(
+    tmp_path: Path, repo: str
+) -> None:
+    """Every accepted repo is interpolated into an API path, a clone URL and a directory
+    name, so the charset is constrained once at the point of configuration.
+
+    ``.`` and ``..`` are refused specifically: they are the only segments that change
+    what a path join resolves to. Anything else in the allowed charset is literal.
+    """
+    text = BASE.replace("repos: [my-org/a]", "repos: ['" + repo + "']")
+    with pytest.raises(ConfigError):
+        load_config(write(tmp_path, text))
+
+
+def test_a_dot_only_segment_that_is_not_traversal_is_accepted(tmp_path: Path) -> None:
+    """`...` is a literal segment, not a parent reference; refusing it would be
+    security theatre."""
+    text = BASE.replace("repos: [my-org/a]", "repos: ['my-org/...']")
+    assert load_config(write(tmp_path, text)).github.repos == ("my-org/...",)

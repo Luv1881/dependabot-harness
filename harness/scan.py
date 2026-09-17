@@ -17,7 +17,7 @@ from typing import Any
 
 from .config import HarnessConfig, load_policy
 from .db import Database
-from .models import BudgetLedger
+from .models import BudgetLedger, required_api_key_env
 from .policy import PolicyEngine
 from .sources.checkout import CheckoutManager
 from .sources.github import GithubClient
@@ -62,8 +62,18 @@ class ScanResult:
         }
 
 
-def agents_available() -> bool:
-    return bool(os.environ.get("ANTHROPIC_API_KEY"))
+def agents_available(cfg: HarnessConfig) -> bool:
+    """Whether every configured model provider has a credential available.
+
+    Provider-aware rather than hard-coded to Anthropic: a config pointing at OpenAI with
+    only ``ANTHROPIC_API_KEY`` set would otherwise enable the agent stages and then fail
+    inside the first one.
+    """
+    for model_cfg in cfg.models.values():
+        env_var = required_api_key_env(model_cfg.provider)
+        if env_var and not os.environ.get(env_var):
+            return False
+    return True
 
 
 def scoped_config(cfg: HarnessConfig, repo: str) -> HarnessConfig:
@@ -84,7 +94,7 @@ def scan_public_repo(
     ref: str | None = None,
     use_agents: bool | None = None,
 ) -> ScanResult:
-    enabled = agents_available() if use_agents is None else use_agents
+    enabled = agents_available(cfg) if use_agents is None else use_agents
     scoped = scoped_config(cfg, repo)
     result = ScanResult(repo=repo, run_id=run_id, agents_enabled=enabled)
 

@@ -55,6 +55,67 @@ class TestDiscovery:
         for ecosystem in MANIFESTS.values():
             assert ecosystem in OSV_ECOSYSTEMS
 
+    def test_an_oversized_manifest_is_a_recorded_gap_not_a_silent_skip(
+        self, tmp_path: Path
+    ) -> None:
+        """A multi-megabyte lockfile is normal in a large monorepo. Skipping it silently
+        leaves the run reporting complete coverage over a file nobody examined."""
+        from harness.sources.osv_scan import _MAX_MANIFEST_BYTES
+
+        write(tmp_path, "Cargo.lock", "x" * (_MAX_MANIFEST_BYTES + 1))
+        stats = ScanStats()
+        assert list(discover_dependencies(tmp_path, stats)) == []
+        assert stats.coverage_complete is False
+        assert any("Cargo.lock" in e and "above" in e for e in stats.errors)
+
+    def test_a_deeply_nested_manifest_is_a_gap_not_a_crash(self, tmp_path: Path) -> None:
+        """`json.loads` raises RecursionError on a hostile document, which is not a
+        JSONDecodeError and would otherwise escape the adapter."""
+        write(tmp_path, "package-lock.json", "[" * 200_000 + "]" * 200_000)
+        stats = ScanStats()
+        assert list(discover_dependencies(tmp_path, stats)) == []
+        assert stats.coverage_complete is False
+        assert any("nested too deeply" in e for e in stats.errors)
+
+    def test_a_readable_manifest_alongside_a_bad_one_still_yields_its_dependencies(
+        self, tmp_path: Path
+    ) -> None:
+        from harness.sources.osv_scan import _MAX_MANIFEST_BYTES
+
+        write(tmp_path, "go.mod", "module m\n\nrequire (\n\tgithub.com/a/b v1.2.3\n)\n")
+        write(tmp_path, "Cargo.lock", "x" * (_MAX_MANIFEST_BYTES + 1))
+        stats = ScanStats()
+        found = list(discover_dependencies(tmp_path, stats))
+        assert [f.dependency.name for f in found] == ["github.com/a/b"]
+        assert stats.coverage_complete is False
+
+    def test_a_non_version_reference_is_skipped_not_queried(self, tmp_path: Path) -> None:
+        """`latest` sent to OSV returns nothing, which would be counted as a clean result."""
+        write(
+            tmp_path,
+            "package-lock.json",
+            json.dumps(
+                {
+                    "packages": {
+                        "node_modules/a": {"version": "1.2.3"},
+                        "node_modules/b": {"version": "latest"},
+                        "node_modules/c": {"version": "file:../c"},
+                    }
+                }
+            ),
+        )
+        stats = ScanStats()
+        found = list(discover_dependencies(tmp_path, stats))
+        assert [f.dependency.name for f in found] == ["a"]
+        assert stats.unpinned_skipped == 2
+
+    def test_a_symlinked_directory_is_not_walked(self, tmp_path: Path) -> None:
+        outside = tmp_path.parent / "outside-manifests"
+        outside.mkdir(exist_ok=True)
+        (outside / "go.mod").write_text("require github.com/evil/x v1.0.0\n")
+        (tmp_path / "linked").symlink_to(outside, target_is_directory=True)
+        assert list(discover_dependencies(tmp_path, ScanStats())) == []
+
 
 class StubGithub:
     def default_branch_sha(self, repo: str) -> str:

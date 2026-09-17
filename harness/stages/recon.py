@@ -17,6 +17,7 @@ from typing import Any
 
 from ..config import HarnessConfig
 from ..db import Database
+from ..fsutil import iter_repo_files
 from ..models import BudgetLedger, ModelClient, ModelError, ModelRequest
 from ..models.client import ContextCeilingExceeded
 from ..schemas import SchemaViolation, validate
@@ -50,6 +51,9 @@ DEPLOY_HINTS = (".tf", ".yaml", ".yml")
 DEPLOY_DIR_HINTS = ("deploy", "k8s", "kubernetes", "helm", "charts", "infra", ".github")
 
 _MAX_FILE_CHARS = 6_000
+_MAX_EXCERPT_BYTES = 2_000_000
+"""A file is stat-ed before it is read. The excerpt is truncated anyway, so loading a
+multi-gigabyte file in order to keep the first six thousand characters is pure risk."""
 _MAX_TREE_ENTRIES = 400
 _MAX_EXCERPTS = 25
 
@@ -237,13 +241,11 @@ def build_inventory(repo_path: Path, repo: str) -> str:
 
 
 def _tree(repo_path: Path) -> list[str]:
-    skip = {".git", "node_modules", "vendor", "target", "dist", ".venv", "__pycache__"}
+    skip = frozenset({".git", "node_modules", "vendor", "target", "dist", ".venv", "__pycache__"})
     entries: list[str] = []
-    for path in sorted(repo_path.rglob("*")):
+    for path in iter_repo_files(repo_path, skip_dirs=skip):
         if len(entries) >= _MAX_TREE_ENTRIES:
             break
-        if not path.is_file() or any(part in skip for part in path.parts):
-            continue
         entries.append(str(path.relative_to(repo_path)))
     return entries
 
@@ -265,8 +267,11 @@ def _excerpts(repo_path: Path, tree: list[str]) -> list[tuple[str, str]]:
 
     out: list[tuple[str, str]] = []
     for relative in chosen:
+        target = repo_path / relative
         try:
-            body = (repo_path / relative).read_text(encoding="utf-8", errors="replace")
+            if target.stat().st_size > _MAX_EXCERPT_BYTES:
+                continue
+            body = target.read_text(encoding="utf-8", errors="replace")
         except OSError:
             continue
         out.append((relative, body[:_MAX_FILE_CHARS]))

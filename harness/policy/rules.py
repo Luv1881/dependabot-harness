@@ -15,6 +15,7 @@ from typing import Any
 from ..analysis.imports import build_scanner
 from ..ecosystems import get_adapter
 from ..ecosystems.base import Scope
+from ..util import purl_package_name
 from ..versions import at_or_above, is_patch_level_bump
 from .context import OutcomeKind, RuleContext, RuleOutcome
 
@@ -126,10 +127,12 @@ class NotImportedRule(ConfiguredRule):
         scanner = build_scanner(ctx.ecosystem)
         if scanner is None or not scanner.supports_package_membership:
             return None
+        package = scanner.normalize_package(purl_package_name(ctx.alert.purl))
+        if not package:
+            return None
         index = ctx.facts.import_index(ctx.ecosystem)
         if not index.scanned:
             return None
-        package = scanner.normalize_package(_package_name(ctx.alert.purl))
         if index.any_prefix(package) is not False:
             return None
         return self._outcome(
@@ -157,8 +160,3 @@ RULE_TYPES: dict[str, type[ConfiguredRule]] = {
     "not_imported": NotImportedRule,
     "trivial_patch": TrivialPatchRule,
 }
-
-
-def _package_name(purl: str) -> str:
-    body = purl.split(":", 1)[1] if ":" in purl else purl
-    return body.split("/", 1)[1] if "/" in body else body

@@ -9,14 +9,15 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import os
 import sys
 import uuid
 from dataclasses import dataclass
 from typing import Any
 
-from .config import ConfigError, load_config, load_policy
+from .config import ConfigError, HarnessConfig, load_config, load_policy, valid_repo
 from .db import Database
-from .models import BudgetLedger
+from .models import BudgetLedger, ProviderConfigurationError, required_api_key_env
 from .policy import PolicyEngine
 from .scan import scan_public_repo
 from .sources.github import GithubClient
@@ -44,6 +45,28 @@ def _new_run_id() -> str:
     return uuid.uuid4().hex[:16]
 
 
+def preflight_model_credentials(cfg: HarnessConfig) -> None:
+    """Fail before any work starts when a configured provider has no credential.
+
+    The check belongs here rather than only in the model client: the client is built
+    lazily inside a stage, so by the time it raises, ingest and policy have already run
+    and the operator has waited for nothing. The message names the environment variable
+    to set, because 'authentication failed' does not tell anyone where to put the key.
+    """
+    missing = [
+        f"{role} (provider {model.provider!r}) needs {env_var}"
+        for role, model in sorted(cfg.models.items())
+        if (env_var := required_api_key_env(model.provider)) and not os.environ.get(env_var)
+    ]
+    if missing:
+        raise ProviderConfigurationError(
+            "model credentials are missing, so the agent stages cannot run: "
+            + "; ".join(missing)
+            + ". Export the named variable(s) and re-run; the eval and scan-public paths "
+            "run without them."
+        )
+
+
 @dataclass
 class RunOutcome:
     ingest: IngestReport
@@ -58,6 +81,7 @@ class RunOutcome:
 
 def _execute(cfg_path: str, policy_path: str, run_id: str, *, resuming: bool) -> RunOutcome:
     cfg = load_config(cfg_path)
+    preflight_model_credentials(cfg)
     engine = PolicyEngine(load_policy(policy_path))
     with Database(cfg.storage.db_path) as db:
         if resuming:
@@ -71,6 +95,7 @@ def _execute(cfg_path: str, policy_path: str, run_id: str, *, resuming: bool) ->
                 )
         db.start_run(run_id, cfg.hash)
         ingest_stage = IngestStage(cfg, db)
+        github = GithubClient(cfg.github)
         try:
             ingest_report = ingest_stage.run(run_id)
             policy_report = PolicyStage(cfg, db, engine).run(run_id)
@@ -81,13 +106,14 @@ def _execute(cfg_path: str, policy_path: str, run_id: str, *, resuming: bool) ->
             judgment_report = JudgmentStage(cfg, db, ledger).run(run_id)
             propagate_verdicts(db, run_id)
             validation_report = ValidationStage(cfg, db, ledger).run(run_id)
-            emit_report = EmitStage(cfg, db, github=GithubClient(cfg.github)).run(run_id)
+            emit_report = EmitStage(cfg, db, github=github).run(run_id)
             db.finish_run(run_id, "complete")
         except BaseException:
             db.finish_run(run_id, "aborted")
             raise
         finally:
             ingest_stage.close()
+            github.close()
         return RunOutcome(
             ingest=ingest_report,
             policy=policy_report,
@@ -114,14 +140,21 @@ def cmd_resume(args: argparse.Namespace) -> int:
 def cmd_scan_public(args: argparse.Namespace) -> int:
     """Triage a repository the harness does not administer, via OSV."""
     cfg = load_config(args.config)
+    if not valid_repo(args.repo):
+        raise ConfigError(
+            f"scan-public --repo must look like 'owner/name', got {args.repo!r}"
+        )
     run_id = args.run_id or _new_run_id()
+    use_agents = None if args.agents == "auto" else args.agents == "on"
+    if use_agents:
+        preflight_model_credentials(cfg)
     result = scan_public_repo(
         cfg,
         args.repo,
         run_id,
         policy_path=args.policy,
         ref=args.ref,
-        use_agents=None if args.agents == "auto" else args.agents == "on",
+        use_agents=use_agents,
     )
     print(json.dumps(result.to_dict(), indent=2))
 
@@ -140,7 +173,7 @@ def cmd_scan_public(args: argparse.Namespace) -> int:
             discovery.get("unqueried", 0),
         )
     if not result.agents_enabled:
-        log.info("agent stages skipped: ANTHROPIC_API_KEY is not set")
+        log.info("agent stages skipped: no model API key is set in the environment")
     return 0
 
 
@@ -282,7 +315,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--agents",
         choices=("auto", "on", "off"),
         default="auto",
-        help="auto enables agent stages only when ANTHROPIC_API_KEY is set",
+        help="auto enables agent stages only when every configured provider has a key",
     )
     scan.set_defaults(func=cmd_scan_public)
 
@@ -301,6 +334,9 @@ def main(argv: list[str] | None = None) -> int:
     except ConfigError as exc:
         log.error("config: %s", exc)
         return 2
+    except ProviderConfigurationError as exc:
+        log.error("model provider: %s", exc)
+        return 3
 
 
 if __name__ == "__main__":

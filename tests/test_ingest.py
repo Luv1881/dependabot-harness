@@ -160,6 +160,49 @@ def build(cfg: HarnessConfig, db: Database, github: FakeGithub, **kw: Any) -> In
     )
 
 
+class TestHostileManifest:
+    """A manifest is untrusted input from a repository the operator does not control.
+
+    Whatever it contains, the answer is an unknown scope — never a runtime scope, and
+    never an aborted ingest for the whole fleet.
+    """
+
+    @pytest.mark.parametrize(
+        "manifest_text",
+        [
+            "[" * 200_000 + "]" * 200_000,
+            "\x00\x01\x02 not a manifest at all",
+            "module m\nrequire (\n\tunterminated",
+            '{"a": ' + '{"a": ' * 5_000 + "}" * 5_000 + "}",
+        ],
+    )
+    def test_an_unparsable_manifest_yields_an_unknown_scope(
+        self, cfg: HarnessConfig, manifest_text: str
+    ) -> None:
+        class HostileGithub(FakeGithub):
+            def file_text(self, repo: str, path: str, ref: str) -> str | None:
+                return manifest_text
+
+        with Database(cfg.storage.db_path) as db:
+            stage = build(cfg, db, HostileGithub([make_raw(manifest="requirements.txt")]))
+            stage.run("run1")
+            alert = db.alerts_for_repo("my-org/service-a")[0]
+
+        assert alert.dep_scope == "unknown"
+
+    def test_an_unreadable_manifest_yields_an_unknown_scope(self, cfg: HarnessConfig) -> None:
+        class NoManifest(FakeGithub):
+            def file_text(self, repo: str, path: str, ref: str) -> str | None:
+                return None
+
+        with Database(cfg.storage.db_path) as db:
+            stage = build(cfg, db, NoManifest([make_raw()]))
+            stage.run("run1")
+            alert = db.alerts_for_repo("my-org/service-a")[0]
+
+        assert alert.dep_scope == "unknown"
+
+
 class TestEnrichment:
     def test_alert_is_fully_enriched(self, cfg: HarnessConfig) -> None:
         with Database(cfg.storage.db_path) as db:

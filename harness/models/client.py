@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import Any
@@ -21,7 +22,14 @@ from typing import Any
 from ..config import ModelConfig
 from ..util import retry_with_backoff
 from .budget import BudgetLedger, Usage, is_priced
-from .errors import Classification, ModelError, ResponseClass, classify
+from .errors import (
+    Classification,
+    ModelError,
+    ProviderConfigurationError,
+    ResponseClass,
+    classify,
+    is_permanent_provider_error,
+)
 
 log = logging.getLogger(__name__)
 
@@ -97,6 +105,9 @@ class ModelProvider(ABC):
 
     name: str
 
+    def __init__(self, api_key: str | None = None) -> None:
+        self._api_key = api_key
+
     @abstractmethod
     def complete(self, request: ModelRequest, model: str) -> ModelResponse: ...
 
@@ -105,7 +116,7 @@ class AnthropicProvider(ModelProvider):
     name = "anthropic"
 
     def __init__(self, api_key: str | None = None) -> None:
-        self._api_key = api_key
+        super().__init__(api_key)
         self._client: Any = None
 
     def _ensure_client(self) -> Any:
@@ -181,7 +192,7 @@ class OpenAIProvider(ModelProvider):
     name = "openai"
 
     def __init__(self, api_key: str | None = None) -> None:
-        self._api_key = api_key
+        super().__init__(api_key)
         self._client: Any = None
 
     def _ensure_client(self) -> Any:
@@ -226,12 +237,40 @@ PROVIDERS: dict[str, type[ModelProvider]] = {
     "openai": OpenAIProvider,
 }
 
+PROVIDER_API_KEY_ENV: dict[str, str] = {
+    "anthropic": "ANTHROPIC_API_KEY",
+    "openai": "OPENAI_API_KEY",
+}
+"""The environment variable each provider reads its key from.
+
+Resolved explicitly rather than left to the SDK's own lookup so that a missing key is
+reported once, by name, at construction instead of surfacing as a retried 401 deep
+inside an agent loop.
+"""
+
+
+def required_api_key_env(name: str) -> str | None:
+    """The env var a provider needs, or None when it needs no credential."""
+    return PROVIDER_API_KEY_ENV.get(name)
+
 
 def build_provider(name: str) -> ModelProvider:
+    """Construct a provider, failing fast when its credential is absent."""
     try:
-        return PROVIDERS[name]()
+        provider_cls = PROVIDERS[name]
     except KeyError as exc:
         raise ValueError(f"unknown model provider {name!r}") from exc
+
+    env_var = PROVIDER_API_KEY_ENV.get(name)
+    if env_var is None:
+        return provider_cls()
+    api_key = os.environ.get(env_var)
+    if not api_key:
+        raise ProviderConfigurationError(
+            f"model provider {name!r} requires an API key: set {env_var} in the "
+            "environment before running the agent stages"
+        )
+    return provider_cls(api_key=api_key)
 
 
 class ModelClient:
@@ -263,11 +302,10 @@ class ModelClient:
         def once() -> ModelResponse:
             try:
                 response = self.provider.complete(request, self.cfg.model)
+            except ModelError:
+                raise
             except Exception as exc:
-                raise ModelError(
-                    f"{self.cfg.role}: provider call raised {type(exc).__name__}: {exc}",
-                    ResponseClass.TRANSIENT,
-                ) from exc
+                raise self._classify_provider_exception(exc) from exc
             response.classification = classify(
                 response.text,
                 stop_reason=response.stop_reason,
@@ -291,9 +329,31 @@ class ModelClient:
             once,
             attempts=self.max_attempts,
             retry_on=(ModelError,),
+            retry_if=lambda exc: getattr(exc, "is_retryable", True),
             on_retry=lambda attempt, delay, exc: log.warning(
                 "%s retry %d after %.1fs: %s", self.cfg.role, attempt, delay, exc
             ),
+        )
+
+    def _classify_provider_exception(self, exc: BaseException) -> ModelError:
+        """Turn a raw SDK exception into the retryability it actually has.
+
+        The two cases are genuinely different failures and must not be collapsed. A
+        dropped connection is worth three attempts; an unset key, a rejected key, or an
+        SDK that is not installed will fail identically every time, and retrying turns a
+        one-line configuration error into a `RetryExhausted` that names nothing.
+        """
+        if is_permanent_provider_error(exc):
+            hint = ""
+            if isinstance(exc, ImportError):
+                hint = f"; install it with `pip install {self.cfg.provider}`"
+            return ProviderConfigurationError(
+                f"{self.cfg.role}: provider {self.cfg.provider!r} is not usable: "
+                f"{type(exc).__name__}: {exc}{hint}"
+            )
+        return ModelError(
+            f"{self.cfg.role}: provider call raised {type(exc).__name__}: {exc}",
+            ResponseClass.TRANSIENT,
         )
 
     def _enforce_ceiling(self, request: ModelRequest) -> None:

@@ -16,6 +16,7 @@ from harness.ecosystems import (
     get_adapter,
     supported_ecosystems,
 )
+from harness.ecosystems.base import Dependency
 
 
 class TestRegistry:
@@ -249,3 +250,41 @@ class TestReachabilityNotImplemented:
         result = adapter.reachability(tmp_path, None)  # type: ignore[attr-defined]
         assert result.method == "failed"
         assert result.confidence == 0.0
+
+
+class TestIsPinned:
+    """A version that is not a version cannot be matched against an affected range.
+
+    Querying OSV for `latest` returns nothing, and nothing is then counted as 'checked
+    and clean'. Excluding these keeps an unanswerable query from reading as an answer.
+    """
+
+    @pytest.mark.parametrize(
+        "version",
+        ["1.2.3", "v1.2.3", "2026.1", "0.0.1", "1.0.0-rc.1", "1.0.0-rc.1+build", "1.2.3.4"],
+    )
+    def test_a_concrete_version_is_pinned(self, version: str) -> None:
+        assert Dependency(name="x", version=version).is_pinned is True
+
+    @pytest.mark.parametrize(
+        "version",
+        [
+            "latest",
+            "next",
+            "*",
+            "2.x",
+            "1.2.x",
+            "1.2.X",
+            "^1.2.3",
+            "~1.2",
+            ">=1.0",
+            "file:../local-pkg",
+            "git+https://github.com/a/b.git",
+            "npm:other@1.0.0",
+            "workspace:*",
+            "",
+            " 1.2.3 ",
+        ],
+    )
+    def test_a_range_or_reference_is_not_pinned(self, version: str) -> None:
+        assert Dependency(name="x", version=version).is_pinned is False

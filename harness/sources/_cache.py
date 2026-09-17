@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 from pathlib import Path
 from typing import Any
 
@@ -23,21 +24,42 @@ class JsonCache:
         self.ttl_days = ttl_days
 
     def _path(self, key: str) -> Path:
+        """Keys are hashed, never used as filenames.
+
+        A cache key can be a model-supplied advisory id, so a traversal sequence in one
+        must not be able to choose where the write lands.
+        """
         return self.root / f"{hashlib.sha256(key.encode()).hexdigest()}.json"
 
     def get(self, key: str) -> Any | None:
+        """The cached value, or None when absent, expired, or unreadable.
+
+        A malformed entry is a miss rather than an exception. A truncated cache file is
+        not a reason to abort a triage run, and refusing to start because of one would
+        turn a local disk problem into a fleet-wide outage.
+        """
         path = self._path(key)
         if not path.is_file():
             return None
         try:
             entry = json.loads(path.read_text())
-        except (json.JSONDecodeError, OSError):
+        except (json.JSONDecodeError, OSError, UnicodeDecodeError):
             return None
-        if age_days(entry["fetched_at"]) > self.ttl_days:
+        if not isinstance(entry, dict):
             return None
-        return entry["value"]
+        fetched_at = entry.get("fetched_at")
+        if not isinstance(fetched_at, str):
+            return None
+        try:
+            expired = age_days(fetched_at) > self.ttl_days
+        except (TypeError, ValueError):
+            return None
+        if expired:
+            return None
+        return entry.get("value")
 
     def put(self, key: str, value: Any) -> None:
-        tmp = self._path(key).with_suffix(".tmp")
+        path = self._path(key)
+        tmp = path.with_suffix(f".{os.getpid()}.tmp")
         tmp.write_text(json.dumps({"fetched_at": utcnow(), "key": key, "value": value}))
-        tmp.replace(self._path(key))
+        tmp.replace(path)
