@@ -15,7 +15,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from ..config import HarnessConfig
+from ..config import HarnessConfig, assert_model_divergence
 from ..db import AlertRecord, Database
 from ..models import BudgetLedger, ModelClient, ModelError, ModelRequest
 from ..models.client import ContextCeilingExceeded
@@ -62,6 +62,15 @@ class ValidationReport:
 
 
 class ValidationStage:
+    """Adversarial confirmation, or mechanical checks alone when no validator is configured.
+
+    A single-model deployment is supported deliberately. It is not a loophole: without a
+    validator nothing is ever marked confirmed, so the dismissal gate refuses every
+    alert for want of the agreement it requires. The mechanical checks — schema, CISA
+    justification, confidence ceiling, reachability contradiction, citation existence —
+    are pure code and still run in full.
+    """
+
     def __init__(
         self,
         cfg: HarnessConfig,
@@ -74,23 +83,25 @@ class ValidationStage:
         self.cfg = cfg
         self.db = db
         self.ledger = ledger
-        self.client = client or ModelClient(cfg.model(ROLE), ledger)
+        validator = cfg.models.get(ROLE)
+        self.client = client
+        if self.client is None and validator is not None:
+            self.client = ModelClient(validator, ledger)
         self.checkouts = checkouts or CheckoutManager(cfg.storage.checkout_dir, cfg.github)
-        self.prompt = _PROMPT_PATH.read_text()
-        self._assert_divergence()
+        self.prompt = _PROMPT_PATH.read_text() if self.client is not None else ""
+        assert_model_divergence(cfg)
 
-    def _assert_divergence(self) -> None:
-        """Nothing grades its own homework. Fail here, not silently mid-run."""
-        judgment = self.cfg.model("judgment")
-        validator = self.cfg.model(ROLE)
-        if judgment.identity == validator.identity:
-            raise ValueError(
-                "validator model must differ from judgment model; both are "
-                f"{judgment.provider}/{judgment.model}"
-            )
+    @property
+    def adversarial_enabled(self) -> bool:
+        return self.client is not None
 
     def run(self, run_id: str) -> ValidationReport:
         report = ValidationReport(run_id=run_id)
+        if not self.adversarial_enabled:
+            log.warning(
+                "no validator model is configured; mechanical checks only, every verdict "
+                "stays unconfirmed, and the dismissal gate will refuse everything"
+            )
         for repo in self.cfg.github.repos:
             self.run_repo(run_id, repo, report)
         return report
@@ -138,6 +149,8 @@ class ValidationStage:
         verdict: dict[str, Any],
         bundle: dict[str, Any] | None,
     ) -> dict[str, Any] | None:
+        if self.client is None:
+            return None
         decision = self.ledger.check(repo=repo, alert_key=alert.alert_key)
         if not decision.allowed:
             return None

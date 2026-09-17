@@ -17,7 +17,13 @@ from typing import Any
 
 from .config import ConfigError, HarnessConfig, load_config, load_policy, valid_repo
 from .db import Database
-from .models import BudgetLedger, ProviderConfigurationError, required_api_key_env
+from .models import (
+    BudgetLedger,
+    CatalogueError,
+    ProviderConfigurationError,
+    list_models,
+    required_api_key_env,
+)
 from .policy import PolicyEngine
 from .scan import scan_public_repo
 from .sources.github import GithubClient
@@ -177,6 +183,33 @@ def cmd_scan_public(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_models(args: argparse.Namespace) -> int:
+    """Ask each configured provider which models the credential can actually call.
+
+    Tier names are marketing. This resolves the name to the identifier the API accepts,
+    so a config is not written on a guess and a run does not spend money discovering
+    that the guess was wrong.
+    """
+    cfg = load_config(args.config, require_github_auth=False)
+    providers = sorted({model.provider for model in cfg.models.values()})
+    payload: dict[str, Any] = {}
+    failed = False
+    for provider in providers:
+        env_var = required_api_key_env(provider)
+        api_key = os.environ.get(env_var) if env_var else None
+        if not api_key:
+            payload[provider] = {"error": f"{env_var} is not set"}
+            failed = True
+            continue
+        try:
+            payload[provider] = {"models": list_models(provider, api_key)}
+        except CatalogueError as exc:
+            payload[provider] = {"error": str(exc)}
+            failed = True
+    print(json.dumps(payload, indent=2))
+    return 1 if failed else 0
+
+
 def cmd_report(args: argparse.Namespace) -> int:
     cfg = load_config(args.config)
     with Database(cfg.storage.db_path) as db:
@@ -322,6 +355,12 @@ def build_parser() -> argparse.ArgumentParser:
     report = sub.add_parser("report", help="metrics for a run (defaults to the latest)")
     report.add_argument("--run-id")
     report.set_defaults(func=cmd_report)
+
+    models = sub.add_parser(
+        "models",
+        help="list the model ids each configured provider will accept for this credential",
+    )
+    models.set_defaults(func=cmd_models)
 
     return parser
 

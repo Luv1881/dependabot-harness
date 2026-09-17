@@ -1,6 +1,7 @@
 """Provider-agnostic model access, budget accounting, and response classification."""
 
 from .budget import BudgetDecision, BudgetExceeded, BudgetLedger, Usage, price
+from .catalogue import CatalogueError, list_models
 from .client import (
     ContextCeilingExceeded,
     ModelClient,
@@ -16,6 +17,7 @@ __all__ = [
     "BudgetDecision",
     "BudgetExceeded",
     "BudgetLedger",
+    "CatalogueError",
     "Classification",
     "ContextCeilingExceeded",
     "ModelClient",
@@ -28,6 +30,7 @@ __all__ = [
     "Usage",
     "build_provider",
     "classify",
+    "list_models",
     "price",
     "required_api_key_env",
 ]

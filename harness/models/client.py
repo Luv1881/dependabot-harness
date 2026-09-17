@@ -16,7 +16,7 @@ import json
 import logging
 import os
 from abc import ABC, abstractmethod
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any
 
 from ..config import ModelConfig
@@ -188,8 +188,17 @@ def _block_to_dict(block: Any) -> dict[str, Any]:
     return {"type": kind}
 
 
-class OpenAIProvider(ModelProvider):
-    name = "openai"
+class OpenAICompatibleProvider(ModelProvider):
+    """A vendor whose API speaks the OpenAI chat-completions wire format.
+
+    DeepSeek differs from OpenAI in base URL and credential and in nothing else the
+    harness relies on, so the two share one implementation and one response parser
+    rather than a copy that drifts. A vendor with its own wire format (Anthropic) is a
+    separate :class:`ModelProvider`; this class is only for the compatible ones.
+    """
+
+    base_url: str | None = None
+    """None means the SDK's own default, which is what OpenAI itself wants."""
 
     def __init__(self, api_key: str | None = None) -> None:
         super().__init__(api_key)
@@ -199,9 +208,12 @@ class OpenAIProvider(ModelProvider):
         if self._client is None:
             import openai
 
-            self._client = (
-                openai.OpenAI(api_key=self._api_key) if self._api_key else openai.OpenAI()
-            )
+            kwargs: dict[str, Any] = {}
+            if self._api_key:
+                kwargs["api_key"] = self._api_key
+            if self.base_url:
+                kwargs["base_url"] = self.base_url
+            self._client = openai.OpenAI(**kwargs)
         return self._client
 
     def complete(self, request: ModelRequest, model: str) -> ModelResponse:
@@ -232,14 +244,32 @@ class OpenAIProvider(ModelProvider):
         )
 
 
+class OpenAIProvider(OpenAICompatibleProvider):
+    name = "openai"
+
+
+class DeepSeekProvider(OpenAICompatibleProvider):
+    """DeepSeek's public API. OpenAI-compatible, so only the endpoint differs.
+
+    The credential is ``DEEPSEEK_API_KEY`` and is never allowed to fall back to
+    ``OPENAI_API_KEY``: pointing an OpenAI key at a third-party endpoint, or the reverse,
+    is the kind of silent misroute that is only noticed on the invoice.
+    """
+
+    name = "deepseek"
+    base_url = "https://api.deepseek.com/v1"
+
+
 PROVIDERS: dict[str, type[ModelProvider]] = {
     "anthropic": AnthropicProvider,
     "openai": OpenAIProvider,
+    "deepseek": DeepSeekProvider,
 }
 
 PROVIDER_API_KEY_ENV: dict[str, str] = {
     "anthropic": "ANTHROPIC_API_KEY",
     "openai": "OPENAI_API_KEY",
+    "deepseek": "DEEPSEEK_API_KEY",
 }
 """The environment variable each provider reads its key from.
 
@@ -297,6 +327,7 @@ class ModelClient:
         stage: str,
         alert_key: str | None = None,
     ) -> ModelResponse:
+        request = self._clamp_max_tokens(request)
         self._enforce_ceiling(request)
 
         def once() -> ModelResponse:
@@ -355,6 +386,20 @@ class ModelClient:
             f"{self.cfg.role}: provider call raised {type(exc).__name__}: {exc}",
             ResponseClass.TRANSIENT,
         )
+
+    def _clamp_max_tokens(self, request: ModelRequest) -> ModelRequest:
+        """Hold the requested output size inside what this model actually accepts.
+
+        Each stage asks for what its job needs, and that number was chosen against one
+        vendor's limits. A model with a lower output cap rejects the call outright, so the
+        configured ceiling wins and the stage is spared a per-provider branch. The copy is
+        deliberate: the caller keeps its own request object, and the tool loop still
+        appends to the original history list.
+        """
+        ceiling = self.cfg.max_output_tokens
+        if ceiling is None or request.max_tokens <= ceiling:
+            return request
+        return replace(request, max_tokens=ceiling)
 
     def _enforce_ceiling(self, request: ModelRequest) -> None:
         estimated = request.estimated_tokens()

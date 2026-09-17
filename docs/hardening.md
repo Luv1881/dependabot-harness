@@ -228,6 +228,37 @@ Not every suspicion was a defect. These were checked and held:
   `confidence: 0.0` and `method: "failed"`, `EvidenceStage._reachability` converts any
   adapter exception into that, and `clamp` cannot raise confidence out of it.
 
+## Single-model deployments
+
+A deployment with one credential and one model is supported deliberately, and is the
+config shipped in `config/deepseek.yaml`.
+
+§7 requires that the stage confirming a verdict is not the stage that produced it. A
+configuration that points judgment and validation at the same `(provider, model)` is
+refused at startup — a reviewer sharing a base model with the author shares its blind
+spots, and calling that independent review is worse than having none. The honest
+alternative is to **omit** the validator slot rather than duplicate it, and
+`assert_model_divergence` treats an absent validator as that case, not as a violation.
+
+What changes when no validator is configured:
+
+- The **mechanical checks still run in full.** Schema, CISA justification code,
+  confidence ceiling, reachability contradiction and citation existence are pure code
+  and do not depend on a second model.
+- **Nothing is ever marked confirmed.** `validated` is written as `NULL`, which the
+  dismissal gate treats as unconfirmed rather than as agreement.
+- **Every dismissal is blocked.** `auto_dismiss_requires.validator_agreed: true` cannot
+  be satisfied, so no alert is closed. Verdicts are advisory.
+- The run is **reported as such**: the validation report counts the alerts under
+  `validator_unavailable`, puts them in the human queue, and the stage logs why.
+
+This is the safe direction. The failure this design guards against is a verdict nobody
+checked being read as a verdict somebody checked, and an absent validator cannot be
+mistaken for a passing one.
+
+`harness models` exists for the same reason: a tier name is marketing and the identifier
+is what the API accepts, so the provider is asked directly rather than guessed at.
+
 ## Gating
 
 The eval set gates the two rule changes in this audit (`is_pinned`, `purl_package_name`),

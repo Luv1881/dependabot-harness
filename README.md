@@ -80,6 +80,8 @@ python -m venv .venv && .venv/bin/pip install -e ".[dev]"
 
 # The agent stages need the SDK for whichever provider your config names.
 .venv/bin/pip install -e ".[anthropic]"        # or ".[openai]" / ".[agents]"
+# DeepSeek is OpenAI-compatible, so the openai extra covers it:
+#   pip install -e ".[openai]"
 
 cp .env.example .env && "$EDITOR" .env         # fill in GH_TOKEN and a model key
 set -a; . ./.env; set +a                       # export them into this shell
@@ -87,6 +89,7 @@ set -a; . ./.env; set +a                       # export them into this shell
 harness run                                    # full pipeline over config/harness.yaml
 harness resume --run-id <id>                   # continue, redoing nothing completed
 harness report                                 # metrics for the latest run
+harness models                                 # model ids this credential can call
 ```
 
 ### Where credentials go
@@ -101,8 +104,11 @@ config with secret-bearing keys stripped, so rotating a token does not invalidat
 | `GH_APP_ID` + `GH_INSTALLATION_ID` + `GH_PRIVATE_KEY_PATH` | `run`, `scan-public` | preferred for a fleet; takes precedence over `GH_TOKEN` |
 | `ANTHROPIC_API_KEY` | agent stages | when `models.*.provider: anthropic` |
 | `OPENAI_API_KEY` | agent stages | when `models.*.provider: openai` |
+| `DEEPSEEK_API_KEY` | agent stages | when `models.*.provider: deepseek` |
 
-The model key is matched to the provider named in `config/harness.yaml`. `harness run`
+Each vendor's key is its own — there is no fallback between them, because pointing one
+vendor's key at another vendor's endpoint is a misroute that is only noticed on the
+invoice. The model key is matched to the provider named in the config. `harness run`
 checks for it **before** the first stage and exits 3 naming the variable to set, rather
 than failing after ingest has already run. `scan-public` enables the agent stages only
 when the keys they need are present, so the deterministic half stays free:
@@ -113,6 +119,30 @@ python eval/run_eval.py --allow-synthetic            # no credentials at all
 ```
 
 `.env` is git-ignored, along with `*.pem`. Copy `.env.example` to start.
+
+### Finding the model id
+
+Tier names are vendor marketing; the identifier is what the API accepts. Ask the provider
+directly instead of guessing:
+
+```bash
+harness models                    # against the config you intend to run
+harness --config config/deepseek.yaml models
+```
+
+It reads the provider's own listing endpoint, so it needs no GitHub token and no SDK, and
+it reports a rejected key as a rejected key rather than as an empty catalogue.
+
+### Running on a single model
+
+`config/deepseek.yaml` is a worked example: one provider, the cheap tier, and **no
+validator slot**. That is supported deliberately. §7 requires the stage confirming a
+verdict not be the stage that produced it, so judgment and validation on the same model
+is refused at startup — leaving the slot out is the honest alternative.
+
+With no validator, the mechanical checks still run in full, but nothing is ever marked
+confirmed, so the dismissal gate **blocks every alert**. Verdicts are advisory; nothing
+gets closed. Point the validator at a second, different model to enable dismissal.
 
 ### Scanning a public repository without Dependabot access
 

@@ -75,6 +75,12 @@ class ModelConfig:
     model: str
     context_window: int
     max_context_fraction: float = 0.25
+    max_output_tokens: int | None = None
+    """Largest completion this model accepts. None means 'whatever the stage asks for'.
+
+    Stages request a size chosen against one vendor's limits; a model with a lower output
+    cap rejects the call rather than truncating it, so the value is configurable per role.
+    """
 
     @property
     def max_context_tokens(self) -> int:
@@ -158,7 +164,15 @@ def _require(mapping: dict[str, Any], key: str, where: str) -> Any:
     return mapping[key]
 
 
-def load_config(path: str | Path = "config/harness.yaml") -> HarnessConfig:
+def load_config(
+    path: str | Path = "config/harness.yaml", *, require_github_auth: bool = True
+) -> HarnessConfig:
+    """Load and validate the harness config.
+
+    ``require_github_auth`` is False for commands that only need the model configuration.
+    Listing which model ids a credential can call has nothing to do with GitHub, and
+    making it demand a GitHub token would be an obstacle with no purpose.
+    """
     path = Path(path)
     if not path.is_file():
         raise ConfigError(f"config file not found: {path}")
@@ -184,7 +198,7 @@ def load_config(path: str | Path = "config/harness.yaml") -> HarnessConfig:
         private_key_path=gh.get("private_key_path"),
         token=os.environ.get("GH_TOKEN"),
     )
-    if not github.uses_app_auth and not github.token:
+    if require_github_auth and not github.uses_app_auth and not github.token:
         raise ConfigError(
             "github auth unavailable: set GH_APP_ID + GH_INSTALLATION_ID + "
             "GH_PRIVATE_KEY_PATH, or GH_TOKEN"
@@ -198,6 +212,9 @@ def load_config(path: str | Path = "config/harness.yaml") -> HarnessConfig:
             model=_require(spec, "model", f"models.{role}"),
             context_window=int(spec.get("context_window", 200_000)),
             max_context_fraction=float(spec.get("max_context_fraction", 0.25)),
+            max_output_tokens=(
+                int(spec["max_output_tokens"]) if spec.get("max_output_tokens") else None
+            ),
         )
 
     budgets_raw = _require(raw, "budgets", str(path))
@@ -257,16 +274,27 @@ def assert_model_divergence(cfg: HarnessConfig) -> None:
 
     The spec's example config diverges on provider; the requirement is that provider
     *or* model differ. We enforce the pair.
+
+    An **absent** validator is not a divergence violation. It is a different, and
+    deliberately supported, configuration: the mechanical checks still run, no verdict is
+    ever marked confirmed, and the dismissal gate refuses everything for want of the
+    agreement it requires. That is the safe direction, and it is what lets a deployment
+    run on a single model and a single credential — see docs/hardening.md. What is
+    forbidden is pointing judgment and validation at the *same* model and calling the
+    result independent review.
     """
     judgment = cfg.models.get("judgment")
+    if judgment is None:
+        raise ConfigError("models.judgment is required")
     validator = cfg.models.get("validator")
-    if judgment is None or validator is None:
-        raise ConfigError("models.judgment and models.validator are both required")
+    if validator is None:
+        return
     if judgment.identity == validator.identity:
         raise ConfigError(
             "models.validator must differ from models.judgment in provider or model — "
             f"both are {judgment.provider}/{judgment.model}. The stage that confirms a "
-            "verdict cannot be the stage that produced it."
+            "verdict cannot be the stage that produced it. Remove the validator slot "
+            "entirely if only one model is available; dismissals are then blocked."
         )
 
 

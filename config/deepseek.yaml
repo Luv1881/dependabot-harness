@@ -1,0 +1,111 @@
+# Single-provider configuration: DeepSeek, cheap tier only.
+#
+#   harness --config config/deepseek.yaml models      # confirm the id below is real
+#   harness --config config/deepseek.yaml run
+#
+# The credential is DEEPSEEK_API_KEY (see .env.example). It is never allowed to fall back
+# to OPENAI_API_KEY: pointing one vendor's key at another vendor's endpoint is the kind
+# of silent misroute only noticed on the invoice.
+#
+# The SDK is OpenAI-compatible and imported lazily, so install it first:
+#   .venv/bin/pip install -e ".[openai]"
+
+github:
+  app_id: ${GH_APP_ID}
+  installation_id: ${GH_INSTALLATION_ID}
+  private_key_path: ${GH_PRIVATE_KEY_PATH}
+  org: my-org
+  repos:
+    - my-org/service-a
+    - my-org/service-b
+
+models:
+  # Set the model id ONCE, here. Every role below refers back to it, so switching tiers
+  # is a one-line edit rather than four that can silently disagree.
+  #
+  # Tier names are marketing, not identifiers. Run `harness models` to see what the
+  # credential actually accepts; if the cheap tier is served under another name, change
+  # this line and nothing else.
+  recon:
+    provider: deepseek
+    model: &flash deepseek-chat
+    context_window: 131072        # 128k. The 25% ceiling derives from this: 32768.
+    max_output_tokens: 8192       # the API rejects a larger completion, not truncates it
+
+  dedup:
+    provider: deepseek
+    model: *flash
+    context_window: 131072
+    max_output_tokens: 8192
+
+  judgment:
+    provider: deepseek
+    model: *flash
+    context_window: 131072
+    max_output_tokens: 8192
+
+  # ---------------------------------------------------------------------------
+  # The validator slot is deliberately ABSENT.
+  #
+  # §7 requires that the stage confirming a verdict is not the stage that produced it.
+  # Running judgment and validation on one model would satisfy the letter of the config
+  # and violate the point of it, so the harness refuses to start if they match — and the
+  # alternative here is to leave the slot out entirely.
+  #
+  # Leaving it out is supported, not a loophole. The mechanical checks (schema, CISA
+  # justification, confidence ceiling, reachability contradiction, citation existence)
+  # still run in full. But nothing is ever marked confirmed, and the dismissal gate
+  # requires explicit validator agreement — so **every alert is blocked from
+  # auto-dismissal**. Nothing is closed on this configuration; verdicts are advisory.
+  #
+  # To enable dismissals, point the validator at a second, different model. Uncomment:
+  #
+  # validator:
+  #   provider: deepseek
+  #   model: deepseek-reasoner
+  #   context_window: 131072
+  #   max_output_tokens: 8192
+  #
+  # The same model at a different effort setting is NOT a different model. The check
+  # compares (provider, model), so a copy of the judgment entry fails at startup by
+  # design.
+  # ---------------------------------------------------------------------------
+
+budgets:
+  per_repo_usd: 5.00
+  per_alert_usd: 0.40
+  per_run_usd: 100.00
+  # Unlike the default config, a cheap tier is worth giving more room to search: the
+  # cost per call is low and a weaker model benefits more from looking than from
+  # guessing. Still bounded — an agentic loop with no cap will drain the window.
+  judgment_max_tool_calls: 12
+  on_breach: queue_next_run
+
+cache:
+  dir: ./out/cache
+  architecture_ttl_days: 30
+  verdict_ttl_days: 90
+  invalidate_architecture_on_paths:
+    - "**/go.mod"
+    - "**/package.json"
+    - "**/pom.xml"
+    - "**/requirements*.txt"
+    - "**/Dockerfile"
+    - "**/*.tf"
+    - "**/routes/**"
+    - "**/handlers/**"
+
+storage:
+  db_path: ./out/harness.db           # shared with other configs: alerts are fleet-wide
+  checkout_dir: ./out/checkouts
+
+output:
+  vex_dir: ./out/vex
+  sarif_dir: ./out/sarif
+  # Off. With no validator configured the gate would refuse every dismissal anyway, so
+  # enabling it would only invite the belief that alerts are being closed.
+  auto_dismiss: false
+  auto_dismiss_requires:
+    verdict: not_affected
+    confidence_min: 0.85
+    validator_agreed: true

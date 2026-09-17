@@ -416,7 +416,6 @@ class TestProviderCredentialsAreCheckedBeforeUse:
         monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
         with pytest.raises(ProviderConfigurationError, match="ANTHROPIC_API_KEY"):
             build_provider("anthropic")
-
     def test_a_set_key_constructs_the_provider_without_importing_the_sdk(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -435,6 +434,109 @@ class TestProviderCredentialsAreCheckedBeforeUse:
     def test_an_unknown_provider_is_still_a_plain_value_error(self) -> None:
         with pytest.raises(ValueError, match="unknown model provider"):
             build_provider("nonexistent")
+
+
+class TestDeepSeekProvider:
+    """DeepSeek speaks the OpenAI wire format, so it is the same implementation with a
+    different endpoint — not a copy that drifts from it."""
+
+    def test_it_is_registered_under_its_own_name(self) -> None:
+        from harness.models.client import PROVIDERS, DeepSeekProvider
+
+        assert PROVIDERS["deepseek"] is DeepSeekProvider
+        assert DeepSeekProvider.name == "deepseek"
+
+    def test_its_key_is_its_own_environment_variable(self) -> None:
+        assert required_api_key_env("deepseek") == "DEEPSEEK_API_KEY"
+
+    def test_it_does_not_fall_back_to_an_openai_key(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A key belonging to one vendor must never be sent to another vendor's endpoint.
+
+        Pointing an OpenAI key at DeepSeek, or the reverse, is a misroute that works well
+        enough to be noticed only on the invoice.
+        """
+        monkeypatch.setenv("OPENAI_API_KEY", "sk-openai-key")
+        monkeypatch.delenv("DEEPSEEK_API_KEY", raising=False)
+        with pytest.raises(ProviderConfigurationError, match="DEEPSEEK_API_KEY"):
+            build_provider("deepseek")
+
+    def test_a_deepseek_key_constructs_it_without_the_sdk(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-deepseek-key")
+        provider = build_provider("deepseek")
+        assert provider._api_key == "sk-deepseek-key"  # type: ignore[attr-defined]
+        assert provider.base_url == "https://api.deepseek.com/v1"  # type: ignore[attr-defined]
+
+    def test_its_endpoint_matches_what_the_catalogue_queries(self) -> None:
+        """The provider and the `harness models` diagnostic must not drift apart."""
+        from harness.models.catalogue import ENDPOINTS
+        from harness.models.client import DeepSeekProvider
+
+        assert DeepSeekProvider.base_url == ENDPOINTS["deepseek"].base_url
+
+    def test_openai_keeps_the_sdk_default_endpoint(self) -> None:
+        from harness.models.client import OpenAIProvider
+
+        assert OpenAIProvider.base_url is None
+
+
+class TestOutputTokenCeiling:
+    """Stages ask for what their job needs, sized against one vendor's limits. A model
+    with a lower output cap rejects the call outright, so the configured value wins."""
+
+    class Recorder:
+        name = "recorder"
+
+        def __init__(self) -> None:
+            self.max_tokens: int | None = None
+
+        def complete(self, request: ModelRequest, model: str) -> ModelResponse:
+            self.max_tokens = request.max_tokens
+            return ok()
+
+    def _client(self, db: Database, **cfg_kw: Any) -> ModelClient:
+        ledger = BudgetLedger(budget_cfg(), db, "run1")
+        return ModelClient(
+            model_cfg(**cfg_kw), ledger, provider=self.Recorder(), max_attempts=1
+        )
+
+    def test_a_request_above_the_cap_is_clamped(self, db: Database) -> None:
+        client = self._client(db, max_output_tokens=1024)
+        client.complete(
+            ModelRequest(system="s", user="u", max_tokens=8_000),
+            repo="org/a",
+            stage="judgment",
+        )
+        assert client.provider.max_tokens == 1024  # type: ignore[attr-defined]
+
+    def test_a_request_below_the_cap_is_untouched(self, db: Database) -> None:
+        client = self._client(db, max_output_tokens=16_384)
+        client.complete(
+            ModelRequest(system="s", user="u", max_tokens=8_000),
+            repo="org/a",
+            stage="judgment",
+        )
+        assert client.provider.max_tokens == 8_000  # type: ignore[attr-defined]
+
+    def test_no_configured_cap_leaves_the_stage_in_charge(self, db: Database) -> None:
+        client = self._client(db)
+        client.complete(
+            ModelRequest(system="s", user="u", max_tokens=8_000),
+            repo="org/a",
+            stage="judgment",
+        )
+        assert client.provider.max_tokens == 8_000  # type: ignore[attr-defined]
+
+    def test_the_callers_request_object_is_not_mutated(self, db: Database) -> None:
+        """The tool loop appends to the request it owns across rounds; clamping must not
+        reach back into it."""
+        request = ModelRequest(system="s", user="u", max_tokens=8_000)
+        client = self._client(db, max_output_tokens=1024)
+        client.complete(request, repo="org/a", stage="judgment")
+        assert request.max_tokens == 8_000
 
 
 class TestContextEstimateIsPessimistic:

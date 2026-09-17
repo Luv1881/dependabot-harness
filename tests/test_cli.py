@@ -123,3 +123,89 @@ class TestParserSurface:
         parser = build_parser()
         with pytest.raises(SystemExit):
             parser.parse_args(["scan-public", "--repo", "o/r", "--agents", "maybe"])
+
+    def test_models_is_a_command(self) -> None:
+        parser = build_parser()
+        assert parser.parse_args(["models"]).command == "models"
+
+
+DEEPSEEK_CONFIG = BASE % {
+    "recon_provider": "deepseek",
+    "judgment_provider": "deepseek",
+    "validator_provider": "openai",
+}
+
+
+class TestModelsCommand:
+    """`harness models` resolves a tier name to the identifier the API actually accepts.
+
+    It talks to the provider's listing endpoint, so it must work before a config has
+    been proven correct and without demanding credentials it has no use for.
+    """
+
+    def _config(self, tmp_path: Path) -> Path:
+        path = tmp_path / "harness.yaml"
+        path.write_text(DEEPSEEK_CONFIG)
+        return path
+
+    def test_it_does_not_require_a_github_token(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        from harness import cli
+        from harness.models import CatalogueError
+
+        monkeypatch.delenv("GH_TOKEN", raising=False)
+        monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-test")
+        monkeypatch.setenv("OPENAI_API_KEY", "sk-test")
+
+        def fake(provider: str, api_key: str) -> list[str]:
+            if provider == "deepseek":
+                return ["deepseek-chat", "deepseek-reasoner"]
+            raise CatalogueError(f"{provider}: HTTP 500")
+
+        monkeypatch.setattr(cli, "list_models", fake)
+        args = cli.build_parser().parse_args(["--config", str(self._config(tmp_path)), "models"])
+        assert cli.cmd_models(args) == 1
+        assert "deepseek-chat" in capsys.readouterr().out
+
+    def test_a_missing_key_is_reported_per_provider(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        from harness import cli
+
+        monkeypatch.setenv("GH_TOKEN", "ghp_test")
+        monkeypatch.delenv("DEEPSEEK_API_KEY", raising=False)
+        monkeypatch.setenv("OPENAI_API_KEY", "sk-test")
+        monkeypatch.setattr(cli, "list_models", lambda provider, key: [f"{provider}-model"])
+
+        args = cli.build_parser().parse_args(["--config", str(self._config(tmp_path)), "models"])
+        assert cli.cmd_models(args) == 1
+        assert "DEEPSEEK_API_KEY is not set" in capsys.readouterr().out
+
+    def test_a_full_success_exits_zero(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        from harness import cli
+
+        monkeypatch.setenv("GH_TOKEN", "ghp_test")
+        monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-test")
+        monkeypatch.setenv("OPENAI_API_KEY", "sk-test")
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-test")  # the dedup slot in BASE
+        monkeypatch.setattr(cli, "list_models", lambda provider, key: [f"{provider}-flash"])
+
+        args = cli.build_parser().parse_args(["--config", str(self._config(tmp_path)), "models"])
+        assert cli.cmd_models(args) == 0
+        assert "deepseek-flash" in capsys.readouterr().out
+
+    def test_the_shipped_deepseek_config_loads(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """The committed single-model config must be loadable, not aspirational."""
+        from harness import cli
+
+        monkeypatch.setenv("GH_TOKEN", "ghp_test")
+        monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-test")
+        monkeypatch.setattr(cli, "list_models", lambda provider, key: ["deepseek-chat"])
+
+        args = cli.build_parser().parse_args(["--config", "config/deepseek.yaml", "models"])
+        assert cli.cmd_models(args) == 0

@@ -345,6 +345,127 @@ class TestValidationStage:
             assert provider.calls == 0
 
 
+class TestSingleModelDeployment:
+    """One credential, one model, no validator slot.
+
+    This is supported deliberately rather than tolerated. The mechanical checks are pure
+    code and run in full; nothing is ever marked confirmed, which is what makes the
+    dismissal gate refuse everything. The alternative — pointing judgment and validation
+    at the same model — is refused at startup, because a reviewer sharing a base model
+    with the author shares its blind spots.
+    """
+
+    NO_VALIDATOR = CONFIG.replace(
+        "  validator: {provider: anthropic, model: claude-sonnet-5}\n", ""
+    )
+
+    @pytest.fixture()
+    def single(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> HarnessConfig:
+        monkeypatch.setenv("GH_TOKEN", "ghp_test")
+        path = tmp_path / "harness.yaml"
+        path.write_text(self.NO_VALIDATOR)
+        loaded = load_config(path)
+        object.__setattr__(loaded.storage, "db_path", tmp_path / "harness.db")
+        object.__setattr__(loaded.storage, "checkout_dir", tmp_path / "checkouts")
+        object.__setattr__(loaded.cache, "dir", tmp_path / "cache")
+        return loaded
+
+    def build_single(self, cfg: HarnessConfig, db: Database, root: Path | None) -> ValidationStage:
+        ledger = BudgetLedger(cfg.budgets, db, "run1")
+        return ValidationStage(cfg, db, ledger, checkouts=FakeCheckouts(root))
+
+    def test_the_config_loads_without_a_validator_slot(self, single: HarnessConfig) -> None:
+        assert "validator" not in single.models
+        assert single.models["judgment"] is not None
+
+    def test_the_stage_reports_that_it_has_no_adversary(self, single: HarnessConfig) -> None:
+        with Database(single.storage.db_path) as db:
+            stage = self.build_single(single, db, None)
+            assert stage.adversarial_enabled is False
+
+    def test_mechanical_checks_still_run_in_full(
+        self, single: HarnessConfig, source: Path
+    ) -> None:
+        with Database(single.storage.db_path) as db:
+            seed(db)
+            report = self.build_single(single, db, source).run("run1")
+            assert report.checked == 1
+            assert report.mechanically_rejected == 0
+
+    def test_a_mechanical_failure_is_still_rejected_without_a_validator(
+        self, single: HarnessConfig, source: Path
+    ) -> None:
+        bad = dict(VERDICT)
+        bad["evidence_cited"] = [{"file": "ghost.go", "line": 1, "why": "x"}]
+        with Database(single.storage.db_path) as db:
+            seed(db, verdict=bad)
+            report = self.build_single(single, db, source).run("run1")
+            assert report.mechanically_rejected == 1
+            assert "k1" in report.human_queue
+
+    def test_nothing_is_ever_marked_confirmed(self, single: HarnessConfig, source: Path) -> None:
+        with Database(single.storage.db_path) as db:
+            seed(db)
+            report = self.build_single(single, db, source).run("run1")
+            assert report.validator_unavailable == 1
+            assert db.latest_verdict("k1")["validated"] is None
+
+    def test_the_unavailable_validator_is_queued_for_a_human(
+        self, single: HarnessConfig, source: Path
+    ) -> None:
+        """Silence would be the failure here: an operator must be able to see that no
+        adversarial pass happened, not infer it from an empty report."""
+        with Database(single.storage.db_path) as db:
+            seed(db)
+            report = self.build_single(single, db, source).run("run1")
+            assert "k1" in report.human_queue
+
+    def test_the_dismissal_gate_refuses_everything(
+        self, single: HarnessConfig, source: Path
+    ) -> None:
+        """The end-to-end consequence: with no validator, auto-dismissal cannot fire."""
+        from harness.emit.dismissal import DismissalGate
+
+        with Database(single.storage.db_path) as db:
+            seed(db)
+            self.build_single(single, db, source).run("run1")
+            stored = db.latest_verdict("k1")
+
+        gate = DismissalGate(
+            enabled=True,
+            requirements={
+                "verdict": "not_affected",
+                "confidence_min": 0.5,
+                "validator_agreed": True,
+            },
+            coverage_complete=True,
+        )
+        dismissal = dict(VERDICT)
+        dismissal["verdict"] = "not_affected"
+        dismissal["vex_status"] = "not_affected"
+        dismissal["vex_justification"] = "vulnerable_code_not_present"
+        decision = gate.evaluate(dismissal, stored["validated"])
+        assert decision.allowed is False
+        assert "unconfirmed" in decision.blocked_by
+
+    def test_a_stage_client_injected_by_a_caller_still_wins(
+        self, single: HarnessConfig, source: Path
+    ) -> None:
+        """An explicit client is what the tests and the eval harness use; the absent
+        validator slot must not silently disable it."""
+        with Database(single.storage.db_path) as db:
+            seed(db)
+            ledger = BudgetLedger(single.budgets, db, "run1")
+            client = ModelClient(
+                single.models["judgment"], ledger, provider=FakeProvider(json.dumps(AGREES))
+            )
+            stage = ValidationStage(
+                single, db, ledger, client=client, checkouts=FakeCheckouts(source)
+            )
+            report = stage.run("run1")
+            assert report.agreed == 1
+
+
 class TestModelDivergenceEnforcement:
     def test_stage_refuses_to_construct_when_models_match(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -360,6 +481,35 @@ class TestModelDivergenceEnforcement:
         from harness.config import ConfigError
 
         with pytest.raises(ConfigError, match="must differ"):
+            load_config(path)
+
+    def test_removing_the_validator_is_the_supported_single_model_path(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The error message must point at the escape hatch, not merely forbid."""
+        monkeypatch.setenv("GH_TOKEN", "ghp_test")
+        same = CONFIG.replace(
+            "validator: {provider: anthropic, model: claude-sonnet-5}",
+            "validator: {provider: anthropic, model: claude-opus-5}",
+        )
+        path = tmp_path / "h.yaml"
+        path.write_text(same)
+        from harness.config import ConfigError
+
+        with pytest.raises(ConfigError, match="Remove the validator slot"):
+            load_config(path)
+
+    def test_judgment_is_still_required(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("GH_TOKEN", "ghp_test")
+        path = tmp_path / "h.yaml"
+        path.write_text(
+            CONFIG.replace("  judgment: {provider: anthropic, model: claude-opus-5}\n", "")
+        )
+        from harness.config import ConfigError
+
+        with pytest.raises(ConfigError, match=r"models\.judgment is required"):
             load_config(path)
 
 
