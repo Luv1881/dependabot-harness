@@ -105,7 +105,10 @@ class TestStageWiring:
             assert db.stage_status("run1", record.alert_key, "policy") == "done"
             assert db.latest_verdict(record.alert_key) is None
 
-    def test_dedup_outcome_writes_no_verdict(self, cfg: HarnessConfig) -> None:
+    def test_superseded_alert_is_decided_and_written(self, cfg: HarnessConfig) -> None:
+        """It used to be recorded as `dedup` with no verdict at all, so a superseded alert
+        produced no VEX statement, no SARIF finding, and no dismissal — while still being
+        counted in the cleared percentage."""
         with Database(cfg.storage.db_path) as db:
             first = seed(db, "run1", alert_key="k1", patched_ver="0.3.4")
             seed(db, "run1", alert_key="k2", ghsa_id="GHSA-newer", patched_ver="9.9.9")
@@ -113,8 +116,13 @@ class TestStageWiring:
             build(cfg, db, FakeCheckouts(None)).run("run1")
 
             payload = db.stage_payload("run1", first.alert_key, "policy")
-            assert payload["kind"] == "dedup"
-            assert db.latest_verdict(first.alert_key) is None
+            assert payload["kind"] == "skip_analysis"
+            assert payload["verdict"] == "affected"
+            stored = db.latest_verdict(first.alert_key)
+            assert stored is not None, "a superseded alert must still carry a verdict"
+            verdict = stored["verdict"]
+            assert verdict["verdict"] == "affected"
+            assert "9.9.9" in verdict["recommended_action"]
 
     def test_alert_without_completed_ingest_is_not_evaluated(self, cfg: HarnessConfig) -> None:
         with Database(cfg.storage.db_path) as db:
@@ -221,3 +229,133 @@ class TestStageHandoffSemantics:
             assert db.stage_payload("run1", undecided.alert_key, "policy")["rule_id"] is None
             assert db.stage_status("run1", cleared.alert_key, "policy") == "skipped"
             assert db.stage_payload("run1", cleared.alert_key, "policy")["rule_id"] is not None
+
+
+class TestConfidenceIsHeldToTheEcosystemCeiling:
+    """A policy rule is certain of its fact; the conclusion is only as reliable as the
+    ecosystem's tooling. The ceiling is declared per ecosystem and enforced in the
+    validation stage — which a policy-cleared alert never reaches, so it has to be applied
+    where the verdict is written.
+
+    On a real npm repository this produced 135 `not_affected` verdicts at confidence 1.0
+    against a declared ceiling of 0.55, comfortably over an
+    `auto_dismiss_requires.confidence_min` of 0.85.
+    """
+
+    def test_an_npm_clearance_cannot_exceed_the_npm_ceiling(
+        self, cfg: HarnessConfig, tmp_path: Path
+    ) -> None:
+        root = tmp_path / "src"
+        (root / "src").mkdir(parents=True)
+        (root / "package.json").write_text("{}")
+        (root / "src" / "app.js").write_text("const x = require('express');\n")
+
+        with Database(cfg.storage.db_path) as db:
+            record = seed(
+                db,
+                "run1",
+                alert_key="npm1",
+                ecosystem="npm",
+                purl="pkg:npm/lodash",
+                manifest_path="package.json",
+                resolved_ver="4.17.20",
+                patched_ver="4.17.21",
+            )
+            build(cfg, db, FakeCheckouts(root)).run("run1")
+
+            stored = db.latest_verdict(record.alert_key)
+            assert stored is not None
+            verdict = stored["verdict"]
+            assert verdict["verdict"] == "not_affected"
+            assert verdict["confidence"] <= 0.55
+
+    def test_a_go_clearance_keeps_the_roomier_go_ceiling(
+        self, cfg: HarnessConfig, tmp_path: Path
+    ) -> None:
+        root = tmp_path / "src"
+        (root / "src").mkdir(parents=True)
+        (root / "go.mod").write_text("module m\n")
+        (root / "src" / "main.go").write_text("package main\n")
+
+        with Database(cfg.storage.db_path) as db:
+            record = seed(db, "run1", alert_key="go1")
+            build(cfg, db, FakeCheckouts(root)).run("run1")
+            stored = db.latest_verdict(record.alert_key)
+            assert stored is not None
+            assert stored["verdict"]["confidence"] == 0.95
+
+
+class TestRuleOrdering:
+    """Ordered by what the fact establishes, not by convenience."""
+
+    def test_a_known_exploited_critical_is_never_consolidated_away(
+        self, cfg: HarnessConfig, tmp_path: Path
+    ) -> None:
+        """`superseded` used to run first, so a KEV-listed direct critical with a newer
+        sibling advisory was quietly folded into that sibling instead of escalated."""
+        with Database(cfg.storage.db_path) as db:
+            a = seed(
+                db,
+                "run1",
+                alert_key="kev1",
+                in_kev=True,
+                is_direct=True,
+                cvss_score=9.9,
+                patched_ver="1.0.0",
+            )
+            seed(db, "run1", alert_key="kev2", ghsa_id="GHSA-newer", patched_ver="9.9.9")
+
+            build(cfg, db, FakeCheckouts(None)).run("run1")
+
+            payload = db.stage_payload("run1", a.alert_key, "policy")
+            assert payload["rule_id"] == "kev_direct_critical"
+            assert payload["verdict"] == "affected"
+            assert payload["needs_human"] is True
+
+    def test_a_package_level_clearance_wins_over_per_advisory_consolidation(
+        self, cfg: HarnessConfig, tmp_path: Path
+    ) -> None:
+        """If nothing imports the package, no advisory on it is reachable — a fact valid
+        for every advisory at once, and therefore stronger than a per-advisory note that a
+        newer sibling exists."""
+        root = tmp_path / "src"
+        (root / "src").mkdir(parents=True)
+        (root / "go.mod").write_text("module m\n")
+        (root / "src" / "main.go").write_text("package main\n")
+
+        with Database(cfg.storage.db_path) as db:
+            a = seed(db, "run1", alert_key="ni1", purl="pkg:golang/github.com/never/used")
+            seed(
+                db,
+                "run1",
+                alert_key="ni2",
+                ghsa_id="GHSA-newer",
+                purl="pkg:golang/github.com/never/used",
+                patched_ver="9.9.9",
+            )
+            build(cfg, db, FakeCheckouts(root)).run("run1")
+
+            payload = db.stage_payload("run1", a.alert_key, "policy")
+            assert payload["rule_id"] == "not_imported"
+            assert payload["verdict"] == "not_affected"
+
+
+class TestTheConfidenceClamp:
+    @pytest.mark.parametrize(
+        ("ecosystem", "ceiling"),
+        [("go", 0.95), ("cargo", 0.90), ("pip", 0.75), ("maven", 0.70), ("npm", 0.55)],
+    )
+    def test_it_matches_the_adapter(self, ecosystem: str, ceiling: float) -> None:
+        from harness.policy import policy_confidence
+
+        assert policy_confidence(ecosystem) == ceiling
+
+    def test_an_unknown_ecosystem_gets_no_benefit_of_the_doubt(self) -> None:
+        from harness.policy import CONFIDENCE_WHEN_ECOSYSTEM_UNKNOWN, policy_confidence
+
+        assert policy_confidence("some-new-ecosystem") == CONFIDENCE_WHEN_ECOSYSTEM_UNKNOWN
+
+    def test_it_never_exceeds_one(self) -> None:
+        from harness.policy import policy_confidence
+
+        assert policy_confidence("go") <= 1.0

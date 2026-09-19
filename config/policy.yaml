@@ -1,9 +1,20 @@
 # Deterministic policy rules (§6). Applied before any model is touched.
 # Each rule terminates the alert with a verdict and a machine-readable reason.
-# Engine lands in M2; this file is the data contract.
 #
 # outcome.kind: verdict | escalate | skip_analysis | dedup
-# Order is significant: first match wins.
+#
+# ORDER IS SIGNIFICANT: first match wins. It is ordered by what the fact establishes, not
+# by convenience:
+#
+#   1. CVE-level facts needing no analysis (already patched)
+#   2. escalations  — a known-exploited critical is never cleared by a heuristic below
+#   3. package-level facts, valid for EVERY advisory on that package
+#   4. per-CVE consolidation against a sibling advisory
+#   5. remediation size
+#
+# `dedup` is deliberately unused here. That kind decides nothing on its own; it is only
+# legitimate for an alert that inherits from a dedup cluster's canonical member, and a
+# policy rule does not create clusters. The engine refuses it.
 
 rules:
   - id: already_fixed
@@ -16,14 +27,8 @@ rules:
       vex_status: fixed
       reason: resolved_version_at_or_above_patched
 
-  - id: superseded
-    description: A newer advisory for the same purl supersedes this one.
-    when:
-      superseded_by_newer_advisory: true
-    outcome:
-      kind: dedup
-      reason: superseded_by_newer_advisory
-
+  # Before every clearance below it: a dependency that is actively exploited must never be
+  # talked out of the way by an import heuristic or a sibling advisory.
   - id: kev_direct_critical
     description: Known-exploited, direct dependency, critical CVSS. Escalate, skip analysis.
     when:
@@ -52,6 +57,9 @@ rules:
       vex_justification: component_not_present
       reason: dev_scope_not_in_production_build
 
+  # A package-level fact: if nothing imports the package, no advisory on it is reachable,
+  # so this is valid for every advisory at once. It therefore takes precedence over the
+  # per-advisory consolidation below.
   - id: not_imported
     description: Package name never appears in any import/require/use statement.
     when:
@@ -62,6 +70,24 @@ rules:
       vex_status: not_affected
       vex_justification: vulnerable_code_not_present
       reason: package_never_imported
+
+  # NOT a clearance. Reachability is per-advisory, so a newer patch fixing a sibling CVE
+  # says nothing about whether this advisory's vulnerable symbol is reachable. What it does
+  # establish is that the installed version is inside this advisory's range and that one
+  # upgrade remediates both, so the alert is decided `affected` with that upgrade as its
+  # remedy. Emitting `dedup` here instead buried 132 of 293 alerts on a real repository:
+  # no verdict, no VEX statement, and still counted in the cleared percentage.
+  - id: superseded
+    description: >
+      A newer advisory exists for the same package and manifest, so one upgrade
+      remediates this one as well. Decided `affected` with that upgrade recommended.
+    when:
+      superseded_by_newer_advisory: true
+    outcome:
+      kind: skip_analysis
+      verdict: affected
+      vex_status: affected
+      reason: superseded_by_newer_advisory
 
   - id: trivial_patch
     description: Patched version is a patch-level bump, no major/minor change.

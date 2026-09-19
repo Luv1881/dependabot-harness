@@ -36,6 +36,7 @@ class Rule(ABC):
             "vex_status": outcome.get("vex_status"),
             "vex_justification": outcome.get("vex_justification"),
             "needs_human": bool(outcome.get("needs_human", False)),
+            "recommended_action": outcome.get("recommended_action"),
         }
         detail = dict(overrides.pop("detail", {}))
         merged.update(overrides)
@@ -63,11 +64,33 @@ class AlreadyFixedRule(ConfiguredRule):
 
 
 class SupersededRule(ConfiguredRule):
+    """A newer advisory for the same package exists, so one upgrade fixes both.
+
+    This is *not* a clearance, and treating it as one was a defect: reachability is
+    per-advisory, so a newer patch that fixes a sibling CVE says nothing about whether
+    this advisory's vulnerable symbol is reachable. Sharing the sibling's verdict across
+    two different advisories would be a false-negative path.
+
+    What the fact does establish is that the installed version is inside this advisory's
+    affected range — the alert is open, after all — and that a single upgrade remediates
+    it. So the alert is decided `affected` with that upgrade as its remedy: a real
+    decision, a real VEX statement, and no reachability claim that has not been measured.
+    """
+
     def evaluate(self, ctx: RuleContext) -> RuleOutcome | None:
-        superseding = ctx.facts.newer_advisory_for(ctx.alert)
-        if not superseding:
+        superseding = ctx.facts.superseding_fix_for(ctx.alert)
+        if superseding is None:
             return None
-        return self._outcome(self.spec, detail={"superseded_by": superseding})
+        target = superseding.patched_version or ctx.alert.patched_ver
+        return self._outcome(
+            self.spec,
+            detail={"superseded_by": superseding.ghsa_id, "fix_version": target},
+            recommended_action=(
+                f"upgrade {ctx.alert.purl} to {target or 'a patched version'}; the newer "
+                f"advisory {superseding.ghsa_id} for the same package is fixed by the "
+                "same upgrade"
+            ),
+        )
 
 
 class KevDirectCriticalRule(ConfiguredRule):

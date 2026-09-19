@@ -33,6 +33,18 @@ class RepoEmitResult:
     vex_path: str | None = None
     sarif_path: str | None = None
     errors: list[str] = field(default_factory=list)
+    undecided: int = 0
+    """Alerts that reached emit with no verdict at all. Legitimate while the agent
+    stages are off, because those alerts are still awaiting analysis."""
+    unexplained: int = 0
+    """Of those, the ones a deterministic rule already terminated. That combination is
+    a defect, not a state: the rule claimed to decide the alert and produced nothing. It
+    is what let 132 of 293 alerts on a real repository go silently missing while the
+    report counted them as cleared."""
+
+    @property
+    def accounted_for(self) -> bool:
+        return self.unexplained == 0
 
 
 @dataclass
@@ -44,10 +56,16 @@ class EmitReport:
     def dismissed(self) -> int:
         return sum(r.dismissed for r in self.repos)
 
+    @property
+    def unexplained(self) -> int:
+        return sum(r.unexplained for r in self.repos)
+
     def to_dict(self) -> dict[str, Any]:
         return {
             "run_id": self.run_id,
             "dismissed": self.dismissed,
+            "undecided": sum(r.undecided for r in self.repos),
+            "unexplained": self.unexplained,
             "repos": [r.__dict__ for r in self.repos],
         }
 
@@ -81,6 +99,7 @@ class EmitStage:
         alerts = self.db.alerts_for_repo(repo)
         rows = [(a, self.db.latest_verdict(a.alert_key)) for a in alerts]
         decided = [(a, v) for a, v in rows if v is not None]
+        self._account_for_the_rest(run_id, rows, result)
         if not decided:
             return result
 
@@ -110,6 +129,44 @@ class EmitStage:
             self._maybe_dismiss(run_id, repo, alert, stored, result)
 
         return result
+
+    def _account_for_the_rest(
+        self,
+        run_id: str,
+        rows: list[tuple[AlertRecord, dict[str, Any] | None]],
+        result: RepoEmitResult,
+    ) -> None:
+        """Reconcile every alert that produced no verdict, and refuse to call it fine.
+
+        Two states look alike from the output alone: an alert still awaiting analysis, and
+        an alert a rule terminated but never decided. The first is expected; the second is
+        a defect that removes the alert from every emitted artefact while leaving it in the
+        cleared count. Telling them apart here is what makes that class of bug impossible
+        to ship unnoticed.
+        """
+        undecided = [alert for alert, verdict in rows if verdict is None]
+        result.undecided = len(undecided)
+        if not undecided:
+            return
+
+        terminated = {
+            str(row["alert_key"])
+            for row in self.db.query(
+                "SELECT alert_key, payload_json FROM stage_results "
+                "WHERE run_id=? AND stage='policy'",
+                (run_id,),
+            )
+            if json.loads(row["payload_json"] or "{}").get("rule_id")
+        }
+        missing = [alert.alert_key for alert in undecided if alert.alert_key in terminated]
+        result.unexplained = len(missing)
+        if missing:
+            log.error(
+                "%d alert(s) were terminated by a deterministic rule and produced no "
+                "verdict, so nothing was emitted for them: %s",
+                len(missing),
+                ", ".join(missing[:5]) + ("..." if len(missing) > 5 else ""),
+            )
 
     def _finding(
         self,

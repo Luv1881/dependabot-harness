@@ -9,6 +9,7 @@ from typing import Any
 from ..analysis.imports import ImportIndex, build_scanner
 from ..db import AlertRecord, Database
 from ..versions import try_parse
+from .context import SupersedingFix
 
 
 @dataclass
@@ -51,7 +52,13 @@ class RepoFactsProvider:
             if isinstance(t, dict) and t.get("ships_to_prod")
         ]
 
-    def newer_advisory_for(self, alert: AlertRecord) -> str | None:
+    def superseding_fix_for(self, alert: AlertRecord) -> SupersedingFix | None:
+        """The highest patched version among the other open advisories for this package.
+
+        Same repo, purl and manifest, a different advisory, and a higher patch: one upgrade
+        remediates this alert and that one together. Returns the version as well as the id,
+        because that version is the actionable remedy and this alert's own patch is not.
+        """
         mine = try_parse(alert.patched_ver)
         if mine is None:
             return None
@@ -62,10 +69,11 @@ class RepoFactsProvider:
             (alert.repo, alert.purl, alert.manifest_path, alert.ghsa_id),
         )
         candidates = [
-            (parsed, str(row["ghsa_id"]))
+            (parsed, str(row["ghsa_id"]), row["patched_ver"])
             for row in rows
             if (parsed := try_parse(row["patched_ver"])) is not None and parsed > mine
         ]
         if not candidates:
             return None
-        return max(candidates, key=lambda pair: (pair[0], pair[1]))[1]
+        _version, ghsa_id, patched = max(candidates, key=lambda triple: (triple[0], triple[1]))
+        return SupersedingFix(ghsa_id=ghsa_id, patched_version=str(patched) if patched else None)

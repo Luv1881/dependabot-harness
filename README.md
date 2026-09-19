@@ -218,7 +218,8 @@ two runs over different case sets cannot be compared into a false improvement.
 ## Validated against real projects
 
 Run end to end against [prometheus/prometheus](https://github.com/prometheus/prometheus)
-(537 dependencies, 48 advisories, 68.75% cleared deterministically) and
+(537 dependencies, 87 advisories, 51.6% cleared deterministically with a further 19.4%
+decided affected) and
 [apache/airflow](https://github.com/apache/airflow) — neither administered by the
 operator, both at $0.00 model spend. Six defects surfaced that no synthetic fixture had
 caught. Full results and the bug list: [`docs/validation.md`](docs/validation.md).
@@ -226,18 +227,23 @@ caught. Full results and the bug list: [`docs/validation.md`](docs/validation.md
 ## Security posture
 
 The harness clones and parses source from repositories it does not administer, and treats
-model output as untrusted input to the only write that closes an alert. Two audit passes
-against that threat model — eighteen findings, each fixed and pinned by a test — are
-recorded in [`docs/hardening.md`](docs/hardening.md). The second round was found by running
-the pipeline against real repositories on a real provider rather than by reading it, and it
-found the worst defect in the set: an npm `lockfileVersion: 1` file that produced zero
-dependencies and a **complete coverage** report over a lockfile holding a vulnerable lodash.
+model output as untrusted input to the only write that closes an alert. Three audit passes —
+twenty-four findings, each fixed and pinned by a test — are recorded in
+[`docs/hardening.md`](docs/hardening.md).
+
+The second round was found by running the pipeline against real repositories on a real
+provider. The third was found by going back over the numbers that run produced: the
+`superseded` rule was removing 132 of 294 alerts from every emitted artefact while counting
+them as cleared, and policy verdicts were bypassing the ecosystem confidence ceiling (npm
+`not_affected` at 1.0 against a declared 0.55). Both are now fixed, and the reported
+clearance rate went from an inflated 91% to an honest 75%.
 
 The short version: the agent's tool surface is confined to the checkout and cannot be
 walked out of by a crafted glob, a symlink, or a `..` path; a GitHub token is never
 written to disk; a toolchain failure is never recorded as a clearance; an unpriced model is
-reported as unpriced rather than as free; and a permanent configuration error is never
-retried as a transient one.
+reported as unpriced rather than as free; every alert that is decided produces an output or
+is reported as missing; and a permanent configuration error is never retried as a transient
+one.
 
 ## Verified against real tooling
 

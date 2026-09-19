@@ -1,5 +1,14 @@
 # Validation against real open-source projects
 
+> **Partially corrected.** The clearance percentages below were produced before the
+> round-three fixes in [`docs/hardening.md`](hardening.md), and they counted two things
+> they should not have. `trivial_patch` and `superseded` terminate an alert while leaving
+> the dependency needing an upgrade, so those alerts were never *cleared* — and the
+> `superseded` ones emitted no verdict or VEX statement at all while being included in the
+> total. "22 cleared deterministically (68.75%)" was therefore inflated in both directions
+> at once. The corrected re-measurement is at the bottom of this file; the narrative below
+> is otherwise unchanged and describes the defects those first runs surfaced.
+
 The harness was run end to end against two large, unrelated projects — one Go, one
 Python — neither of which the operator administers.
 
@@ -104,3 +113,25 @@ Six defects that no synthetic fixture had caught:
 
 The CVSS implementation is differential-tested against the `cvss` reference library over
 all 3,888 vectors in the v3.1 base metric space.
+
+## Corrected re-measurement (after round three)
+
+Re-run on a clean database with the fixes in [`docs/hardening.md`](hardening.md) applied.
+The advisory counts are higher than the original runs because OSV's database has grown
+since, so these are a fresh measurement rather than a like-for-like delta.
+
+| | prometheus/prometheus | apache/airflow |
+|---|---:|---:|
+| Dependencies | 537 | 102 |
+| Advisories | 87 | 27 |
+| Evaluated by policy | 62 | 17 |
+| **Cleared** (a non-`affected` verdict) | 32 (51.6%) | 5 (29.4%) |
+| **Decided affected** (terminated, needs an upgrade) | 12 (19.4%) | 5 (29.4%) |
+| Reaching analysis | 18 | 7 |
+| VEX statements emitted | 44 | 17 |
+| Alerts terminated with no output | **0** | **0** |
+
+The headline difference is not that fewer alerts are handled. It is that the previous
+figure reported 68.75% "cleared" for prometheus where the honest split is 51.6% cleared
+and 19.4% decided-affected — and that every terminated alert now carries a verdict, a VEX
+statement and a SARIF finding, where before the `superseded` ones carried none.

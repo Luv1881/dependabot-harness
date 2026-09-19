@@ -17,6 +17,7 @@ from ..config import HarnessConfig
 from ..db import AlertRecord, Database
 from ..policy import ClearanceStats, PolicyEngine, RepoFactsProvider, RuleContext, RuleOutcome
 from ..policy.context import OutcomeKind
+from ..policy.engine import policy_confidence
 from ..sources.checkout import CheckoutError, CheckoutManager, CheckoutProvider
 
 log = logging.getLogger(__name__)
@@ -80,6 +81,8 @@ class PolicyStage:
         rule_id = payload.get("rule_id")
         if rule_id:
             self.engine.stats.by_rule[str(rule_id)] += 1
+            if payload.get("verdict") == "affected":
+                self.engine.stats.affected_by_rule[str(rule_id)] += 1
 
     def _facts_for(self, repo: str, report: PolicyReport) -> RepoFactsProvider:
         snapshot = self.db.query(
@@ -149,7 +152,7 @@ class PolicyStage:
         return {
             "alert_key": alert.alert_key,
             "threat_model": {
-                "attacker": "n/a - cleared by deterministic policy",
+                "attacker": "n/a - decided by deterministic policy, no reachability claim",
                 "boundary_crossed": "n/a",
                 "assumption_broken": "n/a",
                 "preconditions": [],
@@ -158,7 +161,7 @@ class PolicyStage:
             "vex_status": outcome.vex_status,
             "vex_justification": outcome.vex_justification,
             "reachability_confirmed": False,
-            "confidence": 1.0,
+            "confidence": policy_confidence(alert.ecosystem),
             "production_reachable": outcome.verdict == "affected",
             "severity_adjusted": alert.severity,
             "severity_rationale": f"deterministic rule {outcome.rule_id}: {outcome.reason}",
@@ -174,6 +177,13 @@ class PolicyStage:
 
 
 def _recommended_action(alert: AlertRecord, outcome: RuleOutcome) -> str:
+    """The rule's own remedy when it has one, else a version bump derived from the alert.
+
+    A rule knows things the alert does not — `superseded` knows which version fixes this
+    advisory *and* its sibling — so its action, when given, is the more precise one.
+    """
+    if outcome.recommended_action:
+        return outcome.recommended_action
     if outcome.verdict == "affected" and alert.patched_ver:
         return f"bump {alert.purl} to {alert.patched_ver}"
     if outcome.verdict == "fixed":

@@ -9,7 +9,7 @@ from harness.analysis.imports import ImportIndex
 from harness.config import load_policy
 from harness.db import AlertRecord
 from harness.policy import PolicyEngine, PolicyError, RuleContext
-from harness.policy.context import OutcomeKind
+from harness.policy.context import OutcomeKind, SupersedingFix
 from harness.util import utcnow
 
 POLICY = load_policy("config/policy.yaml")
@@ -20,6 +20,7 @@ class StubFacts:
     index: ImportIndex = field(default_factory=lambda: ImportIndex.unavailable("stub"))
     targets: list[str] | None = None
     superseding: str | None = None
+    superseding_version: str | None = "9.9.9"
 
     def import_index(self, ecosystem: str) -> ImportIndex:
         return self.index
@@ -27,8 +28,12 @@ class StubFacts:
     def production_build_targets(self) -> list[str] | None:
         return self.targets
 
-    def newer_advisory_for(self, alert: AlertRecord) -> str | None:
-        return self.superseding
+    def superseding_fix_for(self, alert: AlertRecord) -> SupersedingFix | None:
+        if self.superseding is None:
+            return None
+        return SupersedingFix(
+            ghsa_id=self.superseding, patched_version=self.superseding_version
+        )
 
 
 def alert(**kw: Any) -> AlertRecord:
@@ -98,12 +103,44 @@ class TestAlreadyFixed:
 
 
 class TestSuperseded:
-    def test_emits_dedup_kind_not_a_verdict(self, engine: PolicyEngine) -> None:
+    def test_it_decides_affected_rather_than_burying_the_alert(self, engine: PolicyEngine) -> None:
+        """A superseded alert must not vanish.
+
+        It used to emit `kind: dedup` with no verdict, on the theory that a cluster would
+        carry a decision to it. No cluster ever held these alerts, so on a real repository
+        132 of 293 produced no verdict, no VEX statement and no SARIF finding while still
+        being counted in the cleared percentage.
+        """
         outcome = evaluate(engine, alert(), StubFacts(superseding="GHSA-newer"))
         assert outcome is not None
-        assert outcome.kind is OutcomeKind.DEDUP
-        assert outcome.verdict is None
+        assert outcome.kind is OutcomeKind.SKIP_ANALYSIS
+        assert outcome.verdict == "affected"
+        assert outcome.vex_status == "affected"
         assert outcome.detail["superseded_by"] == "GHSA-newer"
+
+    def test_it_recommends_the_version_that_fixes_both(self, engine: PolicyEngine) -> None:
+        """This advisory's own patch leaves the sibling advisory open, so the remedy has
+        to name the higher version."""
+        outcome = evaluate(
+            engine,
+            alert(patched_ver="1.1.0"),
+            StubFacts(superseding="GHSA-newer", superseding_version="2.0.0"),
+        )
+        assert outcome is not None
+        assert "2.0.0" in (outcome.recommended_action or "")
+        assert "GHSA-newer" in (outcome.recommended_action or "")
+
+    def test_it_makes_no_reachability_claim(self, engine: PolicyEngine) -> None:
+        """Two advisories in one package can have different vulnerable symbols, so this
+        rule must never assert anything derived from the sibling's analysis."""
+        outcome = evaluate(engine, alert(), StubFacts(superseding="GHSA-newer"))
+        assert outcome is not None
+        assert outcome.vex_justification is None
+        assert outcome.is_clearance is False
+
+    def test_no_superseding_advisory_declines(self, engine: PolicyEngine) -> None:
+        outcome = evaluate(engine, alert(), StubFacts(superseding=None))
+        assert outcome is None or outcome.rule_id != "superseded"
 
 
 class TestKevDirectCritical:
@@ -231,11 +268,17 @@ class TestClearanceStats:
 
         stats = engine.stats
         assert stats.total == 4
-        assert stats.cleared == 3
+        assert stats.terminated == 3
+        # `trivial_patch` decided the alert `affected`: terminated, but the dependency
+        # still needs upgrading. Counting that as a clearance is how a report claims a
+        # backlog was cleared while every alert in it is still actionable.
+        assert stats.cleared == 2
+        assert stats.decided_affected == 1
         assert stats.reaching_analysis == 1
         assert stats.by_rule["already_fixed"] == 2
         assert stats.percentages()["already_fixed"] == 50.0
-        assert stats.to_dict()["cleared_pct"] == 75.0
+        assert stats.to_dict()["cleared_pct"] == 50.0
+        assert stats.to_dict()["decided_affected_pct"] == 25.0
 
     def test_empty_stats_do_not_divide_by_zero(self, engine: PolicyEngine) -> None:
         assert engine.stats.to_dict()["cleared_pct"] == 0.0
@@ -374,7 +417,10 @@ class TestSupersededDeterminism:
             subject = AlertRecord(
                 alert_key="s", ghsa_id="GHSA-subject", patched_ver="0.5.0", **base
             )
-            assert facts.newer_advisory_for(subject) == "GHSA-aaaa"
+            fix = facts.superseding_fix_for(subject)
+            assert fix is not None
+            assert fix.ghsa_id == "GHSA-aaaa"
+            assert fix.patched_version == "3.0.0"
             db.close()
 
 
@@ -392,7 +438,15 @@ class TestVerdictShapeValidation:
         with pytest.raises(PolicyError, match="must carry a verdict"):
             evaluate(engine, alert(resolved_ver="1.0.0", patched_ver="0.3.4"))
 
-    def test_dedup_outcome_may_omit_a_verdict(self, engine: PolicyEngine) -> None:
-        outcome = evaluate(engine, alert(), StubFacts(superseding="GHSA-newer"))
-        assert outcome is not None
-        assert outcome.verdict is None
+    def test_dedup_outcome_is_refused(self, engine: PolicyEngine) -> None:
+        """A `dedup` outcome decides nothing on its own, so the engine no longer accepts
+        one. It is only legitimate for an alert that inherits from a dedup cluster's
+        canonical member, and a policy rule does not create clusters — the rule that used
+        it buried 132 of 293 alerts on a real repository."""
+        bad = {
+            "rules": [
+                {"id": "already_fixed", "outcome": {"kind": "dedup", "reason": "x"}}
+            ]
+        }
+        with pytest.raises(PolicyError, match="decides nothing on its own"):
+            evaluate(PolicyEngine(bad), alert(resolved_ver="1.0.0", patched_ver="0.3.4"))

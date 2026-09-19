@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from typing import Any
+from typing import Any, ClassVar
 
 import pytest
 
@@ -396,3 +396,44 @@ class TestEvidenceTrust:
             )
         )
         assert prediction.verdict == "could_not_determine"
+
+
+class TestEveryRuleIsExercised:
+    """A rule the golden set never triggers cannot be gated by it.
+
+    `superseded` had no case at all, which is why a defect that silently removed 132 of 293
+    real alerts from every emitted artefact passed the eval suite unchallenged. This makes
+    the gap visible instead of invisible: adding a rule, or changing one so it stops
+    firing, fails here until a case covers it.
+    """
+
+    KNOWN_UNCOVERED: ClassVar[frozenset[str]] = {
+        # `superseded` decides a *remediation*, not a reachability classification: the
+        # installed version is inside the advisory's range, so the verdict is `affected`
+        # regardless of whether the vulnerable symbol is reachable. The golden set's
+        # reachable/not_reachable labels have no meaning for it, so it is covered by the
+        # engine's structural rule (every terminating outcome must carry a verdict) and by
+        # tests/test_policy.py::TestSuperseded instead.
+        "superseded",
+    }
+
+    def test_every_configured_rule_fires_on_the_golden_set_or_is_listed_uncovered(
+        self,
+    ) -> None:
+        golden = load_golden("eval/golden")
+        engine = PolicyEngine(load_policy("config/policy.yaml"))
+        predictor = DeterministicPredictor(engine)
+
+        # `by_rule` on the engine counts every evaluation, including the golden set's.
+        for subject in golden:
+            predictor.predict(subject)
+        fired = {rule for rule, count in engine.stats.by_rule.items() if count}
+
+        configured = {str(spec["id"]) for spec in load_policy("config/policy.yaml")["rules"]}
+        uncovered = configured - fired
+
+        assert uncovered == self.KNOWN_UNCOVERED, (
+            "policy rules with no coverage in the golden set changed: "
+            f"{sorted(uncovered ^ self.KNOWN_UNCOVERED)}. Add a case, or add the rule to "
+            "KNOWN_UNCOVERED with a reason and the test that covers it instead."
+        )

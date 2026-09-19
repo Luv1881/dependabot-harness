@@ -542,3 +542,88 @@ class TestIncompleteCoverageBlocksDismissal:
             report = EmitStage(cfg, db, github=github, coverage_complete=False).run("run1")
             assert report.dismissed == 0
             assert github.dismissals == []
+
+
+class TestEveryAlertIsAccountedFor:
+    """An alert that produced no verdict is either awaiting analysis or missing.
+
+    Those two states are indistinguishable from the emitted artefacts alone, and only one
+    of them is acceptable. A rule that terminated an alert without deciding it used to be
+    counted as cleared while producing no VEX statement, no SARIF finding and no
+    dismissal — 132 of 293 alerts on a real repository. Emit now reconciles the two.
+    """
+
+    def _alerts(self, db: Database, cfg: HarnessConfig) -> None:
+        db.record_snapshot("my-org/service-a", "sha1", "h1")
+
+    def test_an_alert_awaiting_analysis_is_not_an_error(
+        self, cfg: HarnessConfig, tmp_path: Path
+    ) -> None:
+        """With the agent stages off, reaching analysis is a legitimate resting place."""
+        with Database(cfg.storage.db_path) as db:
+            db.upsert_alert(
+                AlertRecord(
+                    alert_key="awaiting",
+                    repo="my-org/service-a",
+                    ghsa_id="GHSA-x",
+                    purl="pkg:golang/github.com/vuln/lib",
+                    ecosystem="go",
+                    manifest_path="go.mod",
+                    gh_alert_num=1,
+                    first_seen_at=utcnow(),
+                    last_seen_at=utcnow(),
+                    state="open",
+                )
+            )
+            db.record_stage(
+                run_id="run1",
+                alert_key="awaiting",
+                stage="policy",
+                status="done",
+                payload={"rule_id": None, "reason": "no_rule_matched"},
+            )
+            report = EmitStage(cfg, db, github=None).run("run1")
+
+        assert report.to_dict()["undecided"] == 1
+        assert report.unexplained == 0
+
+    def test_an_alert_terminated_without_a_verdict_is_reported(
+        self, cfg: HarnessConfig, tmp_path: Path
+    ) -> None:
+        """The defect signature: a rule claims the alert and emits nothing for it."""
+        with Database(cfg.storage.db_path) as db:
+            db.upsert_alert(
+                AlertRecord(
+                    alert_key="buried",
+                    repo="my-org/service-a",
+                    ghsa_id="GHSA-x",
+                    purl="pkg:npm/lodash",
+                    ecosystem="npm",
+                    manifest_path="package.json",
+                    gh_alert_num=2,
+                    first_seen_at=utcnow(),
+                    last_seen_at=utcnow(),
+                    state="open",
+                )
+            )
+            db.record_stage(
+                run_id="run1",
+                alert_key="buried",
+                stage="policy",
+                status="skipped",
+                payload={"rule_id": "superseded", "reason": "superseded_by_newer_advisory"},
+            )
+            report = EmitStage(cfg, db, github=None).run("run1")
+
+        assert report.to_dict()["unexplained"] == 1
+        assert report.repos[0].accounted_for is False
+
+    def test_an_alert_with_a_verdict_is_neither(
+        self, cfg: HarnessConfig, tmp_path: Path
+    ) -> None:
+        with Database(cfg.storage.db_path) as db:
+            seed(db, {"verdict": "not_affected", "confidence": 0.9})
+            report = EmitStage(cfg, db, github=None).run("run1")
+
+        assert report.to_dict()["undecided"] == 0
+        assert report.unexplained == 0

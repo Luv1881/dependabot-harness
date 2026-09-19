@@ -14,7 +14,8 @@ from ..analysis.imports import ImportIndex
 from ..db import AlertRecord
 from ..ecosystems.base import ReachabilityLevel
 from ..policy import PolicyEngine, RuleContext
-from ..policy.context import OutcomeKind
+from ..policy.context import SupersedingFix
+from ..policy.engine import policy_confidence
 from ..util import utcnow
 from .dataset import GoldenCase, GoldenSet
 from .metrics import EvalReport, Outcome
@@ -41,7 +42,6 @@ class GoldenFacts:
     """Repo facts as recorded on the golden case, not sourced from a live checkout."""
 
     case: GoldenCase
-
     def import_index(self, ecosystem: str) -> ImportIndex:
         if self.case.imports_scanned is None:
             return ImportIndex.unavailable("golden case records no import scan")
@@ -50,8 +50,12 @@ class GoldenFacts:
     def production_build_targets(self) -> list[str] | None:
         return self.case.production_build_targets
 
-    def newer_advisory_for(self, alert: AlertRecord) -> str | None:
-        return self.case.superseded_by
+    def superseding_fix_for(self, alert: AlertRecord) -> SupersedingFix | None:
+        if not self.case.superseded_by:
+            return None
+        return SupersedingFix(
+            ghsa_id=self.case.superseded_by, patched_version=self.case.patched_version
+        )
 
 
 class DeterministicPredictor:
@@ -65,10 +69,13 @@ class DeterministicPredictor:
     def predict(self, case: GoldenCase) -> Prediction:
         alert = to_alert(case)
         outcome = self.engine.evaluate(RuleContext(alert=alert, facts=GoldenFacts(case)))
-        if outcome is not None and outcome.kind is not OutcomeKind.DEDUP:
+        if outcome is not None:
+            # Every terminating outcome now carries a verdict. `dedup` used to be exempt,
+            # and the exemption scored no rule at all: a `superseded` case fell through to
+            # the evidence path and was graded on evidence it never produced.
             return Prediction(
                 verdict=outcome.verdict or "could_not_determine",
-                confidence=1.0,
+                confidence=policy_confidence(case.ecosystem),
                 decided_by="policy",
                 rule_id=outcome.rule_id,
             )

@@ -4,10 +4,22 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from enum import StrEnum
-from typing import Any, Protocol
+from typing import Any, NamedTuple, Protocol
 
 from ..analysis.imports import ImportIndex
 from ..db import AlertRecord
+
+
+class SupersedingFix(NamedTuple):
+    """A newer advisory for the same package whose fix subsumes this one's.
+
+    Carries the patched version, not just the identifier: the useful remedy for a
+    superseded alert is the version that fixes *both*, and reporting only this alert's own
+    (lower) patch would send the operator to a version that still trips its neighbour.
+    """
+
+    ghsa_id: str
+    patched_version: str | None
 
 
 class OutcomeKind(StrEnum):
@@ -26,7 +38,18 @@ class RuleOutcome:
     vex_status: str | None = None
     vex_justification: str | None = None
     needs_human: bool = False
+    recommended_action: str | None = None
     detail: dict[str, Any] = field(default_factory=dict)
+
+    @property
+    def is_clearance(self) -> bool:
+        """Whether this outcome closes the alert for good.
+
+        `affected` is a decision but not a clearance: the dependency still needs
+        upgrading. Counting the two together is what lets a report claim a backlog was
+        cleared while every alert in it is still actionable.
+        """
+        return self.verdict is not None and self.verdict != "affected"
 
     @property
     def terminates_analysis(self) -> bool:
@@ -46,6 +69,7 @@ class RuleOutcome:
             "vex_status": self.vex_status,
             "vex_justification": self.vex_justification,
             "needs_human": self.needs_human,
+            "recommended_action": self.recommended_action,
             "detail": self.detail,
         }
 
@@ -57,7 +81,7 @@ class RepoFacts(Protocol):
 
     def production_build_targets(self) -> list[str] | None: ...
 
-    def newer_advisory_for(self, alert: AlertRecord) -> str | None: ...
+    def superseding_fix_for(self, alert: AlertRecord) -> SupersedingFix | None: ...
 
 
 @dataclass(frozen=True)

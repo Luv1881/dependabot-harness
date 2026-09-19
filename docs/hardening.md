@@ -348,11 +348,11 @@ rejected key as a rejected key rather than as an empty catalogue. It immediately
 
 All three at $0.00 model spend unless noted.
 
-| Repository | Dependencies | Advisories | Cleared by rules | Outcome |
-|---|---:|---:|---:|---|
-| `dependabot/demo` (npm **v1** lockfile) | 6 | 6 | 100% | 3 statements, 3 dismissals blocked |
-| `snyk-labs/nodejs-goof` (npm v2) | 980 | **293** | 91.1% | 18 evidence failures, repo `shallow`, 135 dismissals blocked |
-| `apache/airflow` (Python, 306 MB tree) | 102 | 27 | 58.8% | 5 judged on `deepseek-flash`, 2 mechanically rejected, 13 dismissals blocked |
+| Repository | Dependencies | Advisories | Cleared | Decided affected | Outcome |
+|---|---:|---:|---:|---:|---|
+| `dependabot/demo` (npm **v1** lockfile) | 6 | 6 | 100% | 0% | 6 statements, 6 dismissals blocked |
+| `snyk-labs/nodejs-goof` (npm v2) | 980 | **294** | 74.8% | 16.3% | 18 evidence failures, repo `shallow`, 268 dismissals blocked |
+| `apache/airflow` (Python, 306 MB tree) | 102 | 27 | 29.4% | 29.4% | 5 judged on `deepseek-flash`, 2 mechanically rejected, 17 dismissals blocked |
 
 Airflow was also run with the agent stages **on** for 36 DeepSeek calls. Three things worth
 recording:
@@ -366,6 +366,118 @@ recording:
   implemented, so all 18 measurements are `method: failed, confidence: 0.0, level: 0` — a
   failure, never a low reachability — the repo is flagged `shallow`, and nothing is dismissed.
   "We could not tell" survived contact with 293 real advisories.
+
+## Round three — the results were wrong
+
+The two previous rounds were about the harness doing unsafe things. This one is about it
+*reporting* things it had not done, which I only found by going back over the numbers I had
+already published rather than by reading the code.
+
+### 19. `superseded` removed alerts from every output while counting them as cleared — high
+
+The `superseded` rule emitted `kind: dedup` with no verdict, reasoning that a dedup cluster
+would carry a decision to the alert. No cluster ever held these alerts: clusters are keyed
+on `(ghsa_id, purl, major, patched_version)` and this rule matches on a *different* advisory
+for the same package, so there was no canonical member to inherit from.
+
+Measured on real repositories:
+
+| run | `superseded` alerts | verdict | VEX statement |
+|---|---:|---:|---:|
+| `snyk-labs/nodejs-goof` | 132 | 0 | 0 |
+| `apache/airflow` (agents off) | 4 | 0 | 0 |
+| `apache/airflow` (agents **on**) | 4 | 0 | 0 |
+
+They were counted in the "cleared" percentage while producing no verdict, no OpenVEX
+statement, no SARIF finding, no PR comment and no dismissal. In a real Dependabot workflow
+those alerts stay open forever and the report says they were handled.
+
+The engine's own validator already refused a non-`dedup` outcome with no verdict because it
+"would bury the alert without deciding it" — `dedup` was the exemption, and this rule used
+the exemption without honouring its precondition. **`dedup` is now refused outright for a
+policy rule**, and `superseded` emits `affected` instead: the installed version is inside the
+advisory's range, and a single upgrade remediates it. That is a real decision, a real VEX
+statement, and no reachability claim that was never measured.
+
+`tests/test_policy.py::TestSuperseded`,
+`tests/test_policy_stage.py::TestStageWiring::test_superseded_alert_is_decided_and_written`,
+`tests/test_policy.py::TestVerdictShapeValidation::test_dedup_outcome_is_refused`
+
+### 20. Policy verdicts bypassed the ecosystem confidence ceiling — high
+
+`policy._verdict_document` hardcoded `confidence: 1.0`, and the ceiling check lives in the
+validation stage — which a policy-cleared alert never reaches, because validation requires
+a completed judgment. So the ceiling was enforced on the expensive path and ignored on the
+cheap, high-volume, deterministic one.
+
+On `snyk-labs/nodejs-goof` that produced **135 `not_affected` verdicts at confidence 1.0
+against a declared npm ceiling of 0.55** — nearly double, and comfortably over an
+`auto_dismiss_requires.confidence_min` of 0.85. `CLAUDE.md` states the invariant directly:
+*npm/TS (ceiling = 0.55) must never produce a high-confidence `not_affected`.* It did, 135
+times.
+
+Confidence for a policy verdict is now computed by `policy.policy_confidence()`, clamped to
+the adapter's ceiling, with a deliberately low default for an ecosystem that has no adapter.
+`tests/test_policy_stage.py::TestConfidenceIsHeldToTheEcosystemCeiling`
+
+### 21. "Cleared by deterministic rules" counted decisions that clear nothing — medium
+
+`ClearanceStats.cleared` was `sum(by_rule.values())` — every terminating rule, including
+`trivial_patch` and `kev_direct_critical`, both of which emit `affected` and leave the
+dependency needing an upgrade. The headline metric in the README ("68.75% cleared
+deterministically") was therefore partly counting alerts that still require action.
+
+Stats now separate `terminated`, `cleared` (a non-`affected` verdict) and `decided_affected`.
+On the npm repository the honest figures are 74.8% cleared and 16.3% decided affected, not
+the 91.1% previously reported.
+
+### 22. Rule order let consolidation precede escalation — medium
+
+`superseded` ran second, before `kev_direct_critical`, `dev_only` and `not_imported`. So a
+known-exploited direct critical dependency with a newer sibling advisory was consolidated
+instead of escalated, and a package nothing imports was given a per-advisory note instead of
+the package-level clearance that is valid for every advisory on it at once.
+
+The order is now: CVE-level facts needing no analysis, then escalations, then package-level
+facts, then per-advisory consolidation, then remediation size. Reordering alone moved 85
+alerts on the npm repository from `superseded` to the sounder `not_imported`.
+`tests/test_policy_stage.py::TestRuleOrdering`
+
+### 23. Nothing reconciled alerts against outputs — medium
+
+No stage checked that every ingested alert ended up in an emitted artefact, which is why 19
+could hide. `EmitStage` now separates the two states that look identical from the outside:
+an alert still awaiting analysis (expected) and an alert a rule terminated without deciding
+(impossible after this round). The second is counted as `unexplained`, logged at error
+level, and surfaced in the report. An alert can no longer disappear silently.
+`tests/test_emit.py::TestEveryAlertIsAccountedFor`
+
+### 24. The eval set had no case for the rule that caused it — medium
+
+`build_seed_set.py` never sets `superseded_by`, so no golden case ever triggered the rule.
+The change that buried 132 real alerts was scored by the eval suite and passed without
+comment. A coverage guard now runs every configured rule over the golden set and fails when
+a rule is neither exercised nor explicitly listed as uncovered with a reason; `superseded`
+is the one entry, because its output is a remediation decision and the set's
+reachable/not-reachable labels do not describe it.
+`tests/test_evaluation.py::TestEveryRuleIsExercised`
+
+## Corrected end-to-end results
+
+The numbers previously reported in this document for `snyk-labs/nodejs-goof` were wrong in
+two directions at once: the clearance rate was inflated, and the emitted artefacts were much
+smaller than they should have been. Measured on a clean database:
+
+| | before | after |
+|---|---:|---:|
+| advisories | 293 | 294 |
+| claimed cleared | 91.1% | **74.8%** |
+| decided `affected` | not reported | 16.3% |
+| terminated by a rule | 267 | 268 |
+| VEX statements emitted | 135 | **268** |
+| alerts that vanished | **132** | **0** |
+
+`dependabot/demo` likewise went from 3 emitted statements to 6.
 
 ## Gating
 
