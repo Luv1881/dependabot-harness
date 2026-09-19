@@ -145,12 +145,15 @@ class TestCheckoutDegradation:
             assert db.stage_status("run1", record.alert_key, "policy") == "done"
             assert db.latest_verdict(record.alert_key) is None
 
-    def test_not_imported_fires_with_a_real_checkout(
-        self, cfg: HarnessConfig, tmp_path: Path
+    def test_not_imported_fires_when_the_artifact_provably_lacks_it(
+        self, cfg: HarnessConfig, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         source = tmp_path / "src"
         source.mkdir()
         (source / "main.go").write_text('package main\nimport "fmt"\n')
+        # The artifact is stated rather than computed: computing it needs the toolchain,
+        # and this test is about the stage wiring, not about `go list`.
+        monkeypatch.setattr("harness.policy.facts.shipped_packages", lambda root, eco: {"fmt"})
 
         with Database(cfg.storage.db_path) as db:
             record = seed(db, "run1", resolved_ver="0.3.1", patched_ver="0.9.0")
@@ -159,6 +162,25 @@ class TestCheckoutDegradation:
             payload = db.stage_payload("run1", record.alert_key, "policy")
             assert payload["rule_id"] == "not_imported"
             assert db.latest_verdict(record.alert_key)["verdict"]["verdict"] == "not_affected"
+
+    def test_a_shipped_dependency_is_not_cleared_as_unimported(
+        self, cfg: HarnessConfig, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The package is never imported by the application, and it is still in the
+        bundle because something the application imports depends on it."""
+        source = tmp_path / "src"
+        source.mkdir()
+        (source / "main.go").write_text('package main\nimport "fmt"\n')
+        monkeypatch.setattr(
+            "harness.policy.facts.shipped_packages",
+            lambda root, eco: {"fmt", "github.com/vuln/lib"},
+        )
+
+        with Database(cfg.storage.db_path) as db:
+            record = seed(db, "run1", resolved_ver="0.3.1", patched_ver="0.9.0")
+            build(cfg, db, FakeCheckouts(source)).run("run1")
+            payload = db.stage_payload("run1", record.alert_key, "policy")
+            assert payload["rule_id"] != "not_imported"
 
 
 class TestResume:
@@ -243,12 +265,13 @@ class TestConfidenceIsHeldToTheEcosystemCeiling:
     """
 
     def test_an_npm_clearance_cannot_exceed_the_npm_ceiling(
-        self, cfg: HarnessConfig, tmp_path: Path
+        self, cfg: HarnessConfig, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         root = tmp_path / "src"
         (root / "src").mkdir(parents=True)
         (root / "package.json").write_text("{}")
         (root / "src" / "app.js").write_text("const x = require('express');\n")
+        monkeypatch.setattr("harness.policy.facts.shipped_packages", lambda r, e: {"express"})
 
         with Database(cfg.storage.db_path) as db:
             record = seed(
@@ -270,12 +293,13 @@ class TestConfidenceIsHeldToTheEcosystemCeiling:
             assert verdict["confidence"] <= 0.55
 
     def test_a_go_clearance_keeps_the_roomier_go_ceiling(
-        self, cfg: HarnessConfig, tmp_path: Path
+        self, cfg: HarnessConfig, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         root = tmp_path / "src"
         (root / "src").mkdir(parents=True)
         (root / "go.mod").write_text("module m\n")
         (root / "src" / "main.go").write_text("package main\n")
+        monkeypatch.setattr("harness.policy.facts.shipped_packages", lambda r, e: {"fmt"})
 
         with Database(cfg.storage.db_path) as db:
             record = seed(db, "run1", alert_key="go1")

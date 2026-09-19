@@ -21,6 +21,9 @@ class StubFacts:
     targets: list[str] | None = None
     superseding: str | None = None
     superseding_version: str | None = "9.9.9"
+    shipped: set[str] | None = None
+    """What is in the artifact. None means "not determinable here", which the rule reads
+    as a reason to decline rather than as an empty artifact."""
 
     def import_index(self, ecosystem: str) -> ImportIndex:
         return self.index
@@ -34,6 +37,9 @@ class StubFacts:
         return SupersedingFix(
             ghsa_id=self.superseding, patched_version=self.superseding_version
         )
+
+    def shipped_packages(self, ecosystem: str) -> set[str] | None:
+        return self.shipped
 
 
 def alert(**kw: Any) -> AlertRecord:
@@ -199,7 +205,10 @@ class TestDevOnly:
 
 class TestNotImported:
     def test_fires_when_package_absent_from_scanned_repo(self, engine: PolicyEngine) -> None:
-        facts = StubFacts(index=ImportIndex(scanned=True, modules={"fmt"}, files_scanned=12))
+        facts = StubFacts(
+            index=ImportIndex(scanned=True, modules={"fmt"}, files_scanned=12),
+            shipped={"fmt", "os"},
+        )
         outcome = evaluate(engine, alert(), facts)
         assert outcome is not None
         assert outcome.rule_id == "not_imported"
@@ -215,6 +224,49 @@ class TestNotImported:
     def test_declines_when_scan_unavailable(self, engine: PolicyEngine) -> None:
         outcome = evaluate(engine, alert(), StubFacts(index=ImportIndex.unavailable("no checkout")))
         assert outcome is None or outcome.rule_id != "not_imported"
+
+    def test_declines_when_the_artifact_cannot_be_determined(self, engine: PolicyEngine) -> None:
+        """An import index is evidence about what the application *names*. The verdict
+        carries `vulnerable_code_not_present`, which is a claim about what the application
+        *contains*. With no dependency graph there is no evidence for the second, so the
+        rule declines rather than answering one question from the other."""
+        facts = StubFacts(
+            index=ImportIndex(scanned=True, modules={"fmt"}, files_scanned=12),
+            shipped=None,
+        )
+        outcome = evaluate(engine, alert(), facts)
+        assert outcome is None or outcome.rule_id != "not_imported"
+
+    def test_declines_when_the_package_ships_inside_an_imported_dependent(
+        self, engine: PolicyEngine
+    ) -> None:
+        """`handlebars` is never imported by the application, and it is in the bundle
+        because `hbs` is and `hbs` depends on it. Clearing it would claim its vulnerable
+        code is absent when it is present."""
+        facts = StubFacts(
+            index=ImportIndex(scanned=True, modules={"github.com/app/only"}, files_scanned=9),
+            shipped={"github.com/app/only", "github.com/vuln/lib"},
+        )
+        outcome = evaluate(engine, alert(), facts)
+        assert outcome is None or outcome.rule_id != "not_imported"
+
+    def test_a_subpackage_of_a_shipped_module_also_declines(self, engine: PolicyEngine) -> None:
+        facts = StubFacts(
+            index=ImportIndex(scanned=True, modules={"fmt"}, files_scanned=9),
+            shipped={"github.com/vuln"},
+        )
+        outcome = evaluate(engine, alert(purl="pkg:golang/github.com/vuln/lib"), facts)
+        assert outcome is None or outcome.rule_id != "not_imported"
+
+    def test_the_decision_records_what_the_artifact_held(self, engine: PolicyEngine) -> None:
+        facts = StubFacts(
+            index=ImportIndex(scanned=True, modules={"fmt"}, files_scanned=12),
+            shipped={"fmt", "os", "net/http"},
+        )
+        outcome = evaluate(engine, alert(), facts)
+        assert outcome is not None
+        assert outcome.detail["artifact_packages"] == 3
+        assert outcome.detail["in_artifact"] is False
 
     def test_subpackage_import_counts_as_imported(self, engine: PolicyEngine) -> None:
         facts = StubFacts(

@@ -141,9 +141,17 @@ class DevOnlyRule(ConfiguredRule):
 class NotImportedRule(ConfiguredRule):
     """Package name never appears in any import statement across the repo.
 
-    Declines whenever the scan did not run, the ecosystem has no scanner, or the
-    scanner cannot map a package coordinate onto the identifiers it emits. In each of
-    those cases absence from the index is unmeasured, not proven.
+    Declines whenever the scan did not run, the ecosystem has no scanner, or the scanner
+    cannot map a package coordinate onto the identifiers it emits. In each of those cases
+    absence from the index is unmeasured, not proven.
+
+    It also declines when the package's code is in the *artifact*, whatever the import
+    index says. The verdict carries the CISA code ``vulnerable_code_not_present``, which is
+    a claim about what ships, and a package nothing imports still ships when something
+    that *is* imported depends on it. On a real npm repository this rule cleared 220 alerts
+    on an import index alone, and 127 of them were packages shipped inside an imported
+    dependent — ``handlebars`` inside ``hbs``, ``qs`` inside ``body-parser``. Their
+    vulnerable code was in the bundle.
     """
 
     def evaluate(self, ctx: RuleContext) -> RuleOutcome | None:
@@ -158,10 +166,33 @@ class NotImportedRule(ConfiguredRule):
             return None
         if index.any_prefix(package) is not False:
             return None
+        shipped = ctx.facts.shipped_packages(ctx.ecosystem)
+        if shipped is None:
+            return None
+        if any(_ships_together(package, name) for name in shipped):
+            return None
         return self._outcome(
             self.spec,
-            detail={"package": package, "files_scanned": index.files_scanned},
+            detail={
+                "package": package,
+                "files_scanned": index.files_scanned,
+                "in_artifact": False,
+                "artifact_packages": len(shipped),
+            },
         )
+
+
+def _ships_together(package: str, shipped: str) -> bool:
+    """Whether a shipped name and the alert's package put the same code in the artifact.
+
+    Both directions matter. A subpackage of the package ships (its code is compiled in),
+    and the package nested inside a shipped module ships (it is a package of that module).
+    Go module and package paths share a namespace by prefix, so the relationship is only
+    ever prefix containment.
+    """
+    if package == shipped:
+        return True
+    return package.startswith(f"{shipped}/") or shipped.startswith(f"{package}/")
 
 
 class TrivialPatchRule(ConfiguredRule):

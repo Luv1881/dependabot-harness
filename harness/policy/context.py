@@ -83,6 +83,8 @@ class RepoFacts(Protocol):
 
     def superseding_fix_for(self, alert: AlertRecord) -> SupersedingFix | None: ...
 
+    def shipped_packages(self, ecosystem: str) -> set[str] | None: ...
+
 
 @dataclass(frozen=True)
 class RuleContext:

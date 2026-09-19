@@ -1,0 +1,52 @@
+{
+  "split": "tune",
+  "total_cases": 340,
+  "decidable_cases": 131,
+  "dataset_fingerprint": "9d23718fa19e121c",
+  "reachable_cases": 10,
+  "abstained_on_reachable": 10,
+  "abstention_on_reachable_rate": 1.0,
+  "false_negative_rate": 0.0,
+  "false_negatives": 0,
+  "false_positive_rate": 0.0579,
+  "false_positives": 7,
+  "could_not_determine_rate": 0.3053,
+  "precision": 0.0,
+  "recall": 0.0,
+  "mean_cost_per_alert_usd": 0.0,
+  "validator_disagreement_rate": 0.0,
+  "confusion": {
+    "true_positive": 0,
+    "false_positive": 7,
+    "true_negative": 84,
+    "false_negative": 0
+  },
+  "decided_by": {
+    "policy": 142,
+    "unresolved": 198
+  },
+  "false_negative_cases": [],
+  "predictor": "deterministic",
+  "dataset": {
+    "total": 414,
+    "scored": 340,
+    "labels": {
+      "not_reachable": 144,
+      "unsure": 254,
+      "reachable": 16
+    },
+    "ecosystems": {
+      "npm": 300,
+      "go": 104,
+      "pip": 10
+    },
+    "hand_labeled": 414,
+    "synthetic": 0
+  },
+  "accept_gate": {
+    "requires_hand_labeled_cases": 100,
+    "hand_labeled_present": 414,
+    "satisfied": true,
+    "note": "hand-labeled set meets the required size"
+  }
+}

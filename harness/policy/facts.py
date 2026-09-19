@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any
 
 from ..analysis.imports import ImportIndex, build_scanner
+from ..analysis.shipped import shipped_packages
 from ..db import AlertRecord, Database
 from ..versions import try_parse
 from .context import SupersedingFix
@@ -26,6 +27,7 @@ class RepoFactsProvider:
     architecture: dict[str, Any] | None = None
     structure_hash: str | None = None
     _indexes: dict[str, ImportIndex] = field(default_factory=dict, repr=False)
+    _shipped: dict[str, set[str] | None] = field(default_factory=dict, repr=False)
 
     def import_index(self, ecosystem: str) -> ImportIndex:
         if ecosystem in self._indexes:
@@ -39,6 +41,20 @@ class RepoFactsProvider:
             index = scanner.scan(self.checkout_path)
         self._indexes[ecosystem] = index
         return index
+
+    def shipped_packages(self, ecosystem: str) -> set[str] | None:
+        """What is in the artifact, or None when that cannot be determined here.
+
+        Computed once per (repo, ecosystem) and reused across every alert in the repo, the
+        same way the import index is: the answer depends on the tree, not on the alert.
+        """
+        if ecosystem not in self._shipped:
+            self._shipped[ecosystem] = (
+                None
+                if self.checkout_path is None
+                else shipped_packages(self.checkout_path, ecosystem)
+            )
+        return self._shipped[ecosystem]
 
     def production_build_targets(self) -> list[str] | None:
         if not self.architecture:

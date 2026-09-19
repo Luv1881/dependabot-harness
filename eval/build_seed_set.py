@@ -5,6 +5,10 @@ These cases are NOT hand-labeled real alerts. They exist so the eval harness has
 something to score against on day one, and so the metric plumbing is itself tested.
 Every record carries ``source: "synthetic"``.
 
+They live in ``eval/bootstrap/`` and not in ``eval/golden/``, which now holds real cases
+labelled from independent evidence. Mixing the two would let 120 invented labels dilute a
+false-negative rate computed over a few hundred real ones.
+
 The M4 accept gate requires real alerts labeled by a human. Replace or supplement these
 with records carrying ``source: "hand_labeled"`` before trusting any number this
 produces. `run_eval.py` reports the synthetic share of the set on every run so a
@@ -75,6 +79,10 @@ def build(count: int, seed: int) -> list[dict[str, Any]]:
                 dep_scope="runtime",
                 is_direct=True,
                 imports_scanned=["fmt", "os"],
+                # The fact that makes the clearance justified: what is actually in the
+                # artifact. Without it `not_imported` now declines, because an import
+                # index cannot establish absence from a bundle.
+                shipped_packages=["fmt", "os"],
                 rationale="package never imported anywhere in the repository",
             )
         elif shape in (2, 3):
@@ -170,7 +178,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--count", type=int, default=120)
     parser.add_argument("--seed", type=int, default=1729)
-    parser.add_argument("--out", default="eval/golden/synthetic.jsonl")
+    parser.add_argument("--out", default="eval/bootstrap/synthetic.jsonl")
     args = parser.parse_args()
 
     cases = build(args.count, args.seed)

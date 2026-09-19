@@ -92,6 +92,18 @@ class EvalReport:
         return sum(1 for o in self.decidable if o.label is Label.NOT_REACHABLE)
 
     @property
+    def abstained_on_reachable(self) -> int:
+        """Genuinely reachable cases the pipeline declined to decide.
+
+        Reported separately because a headline of `0 of 0 reachable` reads as "there were no
+        reachable cases" when it can mean "every reachable case was abstained on". The
+        false-negative rate is correctly zero in both, and only one of them is fine.
+        """
+        return sum(
+            1 for o in self.decidable if o.label is Label.REACHABLE and o.is_undecided
+        )
+
+    @property
     def false_negative_rate(self) -> float:
         """Share of genuinely reachable vulnerabilities the harness dismissed."""
         return _ratio(len(self.false_negatives), self.reachable_count)
@@ -163,6 +175,8 @@ class EvalReport:
             "total_cases": self.total,
             "decidable_cases": len(self.decidable),
             "dataset_fingerprint": self.dataset_fingerprint,
+            "reachable_cases": self.reachable_count,
+            "abstained_on_reachable": self.abstained_on_reachable,
             "abstention_on_reachable_rate": round(self.abstention_on_reachable_rate, 4),
             "false_negative_rate": round(self.false_negative_rate, 4),
             "false_negatives": len(self.false_negatives),

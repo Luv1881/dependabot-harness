@@ -43,6 +43,7 @@ class GoldenCase:
     ghsa_id: str
     ecosystem: str
     purl: str
+    cve_id: str | None = None
     resolved_version: str | None = None
     patched_version: str | None = None
     manifest_path: str = ""
@@ -54,6 +55,10 @@ class GoldenCase:
     severity: str | None = None
     symbols: list[str] = field(default_factory=list)
     imports_scanned: list[str] | None = None
+    shipped_packages: list[str] | None = None
+    """Names whose code is in the artifact — the closure of the application's imports over
+    the dependency graph. None means the graph was not available, which the rules must read
+    as 'cannot prove absence' rather than as 'nothing ships'."""
     production_build_targets: list[str] | None = None
     superseded_by: str | None = None
     reachability_level: int | None = None

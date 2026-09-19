@@ -47,6 +47,11 @@ class GoldenFacts:
             return ImportIndex.unavailable("golden case records no import scan")
         return ImportIndex(scanned=True, modules=set(self.case.imports_scanned), files_scanned=1)
 
+    def shipped_packages(self, ecosystem: str) -> set[str] | None:
+        if self.case.shipped_packages is None:
+            return None
+        return set(self.case.shipped_packages)
+
     def production_build_targets(self) -> list[str] | None:
         return self.case.production_build_targets
 

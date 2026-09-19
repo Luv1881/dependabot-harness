@@ -247,24 +247,24 @@ class TestDeterministicPredictor:
 
 class TestSeedSetBaseline:
     def test_seed_set_exists_and_is_large_enough(self) -> None:
-        golden = load_golden("eval/golden")
+        golden = load_golden("eval/bootstrap")
         assert len(golden) >= 100
 
     def test_baseline_has_no_false_negatives(self, predictor: DeterministicPredictor) -> None:
         """The deterministic pipeline must never dismiss a reachable vulnerability."""
-        golden = load_golden("eval/golden")
+        golden = load_golden("eval/bootstrap")
         report = evaluate(golden.tune, predictor)
         assert report.false_negatives == []
         assert report.false_negative_rate == 0.0
 
     def test_holdout_is_not_scored_by_default(self, predictor: DeterministicPredictor) -> None:
-        golden = load_golden("eval/golden")
+        golden = load_golden("eval/bootstrap")
         report = evaluate(golden.tune, predictor)
         holdout_ids = {c.case_id for c in golden.holdout}
         assert not ({o.case_id for o in report.outcomes} & holdout_ids)
 
     def test_every_case_receives_a_verdict(self, predictor: DeterministicPredictor) -> None:
-        golden = load_golden("eval/golden")
+        golden = load_golden("eval/bootstrap")
         report = evaluate(golden, predictor)
         assert len(report.outcomes) == len(golden)
         assert all(o.verdict for o in report.outcomes)
@@ -420,7 +420,7 @@ class TestEveryRuleIsExercised:
     def test_every_configured_rule_fires_on_the_golden_set_or_is_listed_uncovered(
         self,
     ) -> None:
-        golden = load_golden("eval/golden")
+        golden = load_golden("eval/bootstrap")
         engine = PolicyEngine(load_policy("config/policy.yaml"))
         predictor = DeterministicPredictor(engine)
 
@@ -437,3 +437,49 @@ class TestEveryRuleIsExercised:
             f"{sorted(uncovered ^ self.KNOWN_UNCOVERED)}. Add a case, or add the rule to "
             "KNOWN_UNCOVERED with a reason and the test that covers it instead."
         )
+
+
+class TestAbstentionIsNotHiddenByAZeroFalseNegativeRate:
+    """A headline of `0 of 0 reachable` reads as "there were no reachable cases". It can
+    also mean "every reachable case was declined", which the false-negative rate reports as
+    zero for the same reason — none were dismissed. Both are zero; only one is fine.
+
+    The headline derived its denominator from the confusion matrix, which drops
+    abstentions, so a pipeline abstaining on everything printed `0 of 0` over a set with ten
+    reachable cases in it. Found by adding the real labelled set and reading the number.
+    """
+
+    def _report(self, verdict: str) -> EvalReport:
+        return EvalReport(
+            outcomes=[
+                outcome(Label.REACHABLE, verdict, case_id="r1"),
+                outcome(Label.REACHABLE, verdict, case_id="r2"),
+            ]
+        )
+
+    def test_reachable_cases_counts_abstentions(self) -> None:
+        assert self._report("could_not_determine").reachable_count == 2
+
+    def test_abstained_on_reachable_is_separate_from_false_negatives(self) -> None:
+        report = self._report("could_not_determine")
+        assert report.abstained_on_reachable == 2
+        assert len(report.false_negatives) == 0
+        assert report.false_negative_rate == 0.0
+        assert report.abstention_on_reachable_rate == 1.0
+
+    def test_a_dismissal_is_a_false_negative_not_an_abstention(self) -> None:
+        report = self._report("not_affected")
+        assert report.abstained_on_reachable == 0
+        assert len(report.false_negatives) == 2
+        assert report.false_negative_rate == 1.0
+
+    def test_the_serialised_report_carries_the_denominator(self) -> None:
+        payload = self._report("could_not_determine").to_dict()
+        assert payload["reachable_cases"] == 2
+        assert payload["abstained_on_reachable"] == 2
+
+    def test_a_decided_reachable_case_is_a_true_positive(self) -> None:
+        report = self._report("affected")
+        assert report.true_positives == 2
+        assert report.abstained_on_reachable == 0
+        assert report.recall == 1.0

@@ -130,7 +130,12 @@ def _print_headline(payload: dict[str, object]) -> None:
     dataset = payload["dataset"]
     gate = payload["accept_gate"]
     confusion = payload["confusion"]
-    reachable = confusion["true_positive"] + confusion["false_negative"]
+    # The denominator is every reachable case, not just the decided ones. Summing the
+    # confusion matrix alone drops the abstentions, so a pipeline that abstains on all of
+    # them prints `0 of 0 reachable` — which reads as "there were none".
+    reachable = int(payload.get("reachable_cases", 0)) or (
+        confusion["true_positive"] + confusion["false_negative"]
+    )
     print(
         f"\nFN rate {payload['false_negative_rate']:.2%} "
         f"({payload['false_negatives']} of {reachable} reachable) | "
@@ -138,6 +143,15 @@ def _print_headline(payload: dict[str, object]) -> None:
         f"could-not-determine {payload['could_not_determine_rate']:.2%}",
         file=sys.stderr,
     )
+    abstained = int(payload.get("abstained_on_reachable", 0))
+    if reachable and abstained:
+        print(
+            f"WARNING: declined to decide {abstained} of {reachable} genuinely reachable "
+            f"cases ({payload['abstention_on_reachable_rate']:.0%}). The false-negative "
+            "rate is zero because none were dismissed, which is not the same as deciding "
+            "correctly.",
+            file=sys.stderr,
+        )
     scored = int(dataset["scored"])
     if payload["split"] == "holdout" and scored < MIN_MEANINGFUL_HOLDOUT:
         print(
