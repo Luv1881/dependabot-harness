@@ -59,7 +59,16 @@ class GoAdapter(EcosystemAdapter):
         return ScopeResult(scope=Scope.UNKNOWN, is_direct=None, source="go.mod:absent")
 
     def parse_dependencies(self, manifest_text: str) -> list[Dependency]:
-        return [
+        """Every module in go.mod, plus the standard library at the pinned toolchain.
+
+        The standard library is a dependency, and `go.mod` naming it is the only way it
+        becomes visible: stdlib advisories are keyed to the toolchain version, and nothing
+        in a `require` block mentions them. Leaving it out means an entire class of
+        reachable vulnerabilities is never discovered — on prometheus, 7 of the 9 advisories
+        govulncheck found a live call path for were stdlib, and discovery could not see any
+        of them.
+        """
+        found = [
             Dependency(
                 name=module,
                 version=version,
@@ -68,6 +77,11 @@ class GoAdapter(EcosystemAdapter):
             )
             for module, version, rest in _iter_requires(manifest_text)
         ]
+        stdlib = _stdlib_version(manifest_text)
+        if stdlib:
+            # Not direct: it is not something the project chose to depend on.
+            found.insert(0, Dependency(name="stdlib", version=stdlib, scope=Scope.RUNTIME))
+        return found
 
     def resolve_tree(self, repo_path: Path) -> DependencyTree:
         result = self._run(["go", "mod", "graph"], cwd=repo_path)
@@ -321,6 +335,25 @@ class _SymbolQuery:
 def _alert_ids(alert: Any) -> set[str]:
     ids = {getattr(alert, "ghsa_id", "") or "", getattr(alert, "cve_id", "") or ""}
     return {i for i in ids if i}
+
+
+_TOOLCHAIN_DIRECTIVE = re.compile(r"^\s*toolchain\s+go(\d+\.\d+(?:\.\d+)?)", re.MULTILINE)
+_GO_DIRECTIVE = re.compile(r"^\s*go\s+(\d+\.\d+(?:\.\d+)?)\s*$", re.MULTILINE)
+
+
+def _stdlib_version(text: str) -> str | None:
+    """The toolchain version the module is built with, as `go.mod` records it.
+
+    `toolchain` wins when present — it is the explicit answer. `go` is a lower bound on the
+    language version, and Go 1.21 and later allow it to carry a patch, so for a repository
+    that pins it exactly (prometheus pins `go 1.25.8`) it is the real toolchain.
+
+    Querying OSV with a version the database cannot match returns nothing, which is
+    indistinguishable from "no advisories", so a bare `1.25` would silently find nothing.
+    The directive is used verbatim and never padded or guessed at.
+    """
+    match = _TOOLCHAIN_DIRECTIVE.search(text) or _GO_DIRECTIVE.search(text)
+    return match.group(1) if match else None
 
 
 def _iter_requires(text: str) -> list[tuple[str, str, str]]:

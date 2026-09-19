@@ -84,6 +84,14 @@ budgets:
   per_repo_usd: 5.00
   per_alert_usd: 0.40
   per_run_usd: 100.00
+  # Token caps, enforced alongside the dollar caps and independent of them.
+  #
+  # The USD caps below cannot fire while `pricing` is unset: an unpriced call contributes
+  # zero to the ledger, so a threshold on the dollar total is never reached. Tokens are
+  # always known, so these are what actually stops a runaway run on this config.
+  per_repo_tokens: 4000000
+  per_alert_tokens: 400000
+  per_run_tokens: 40000000
   # Unlike the default config, a cheap tier is worth giving more room to search: the
   # cost per call is low and a weaker model benefits more from looking than from
   # guessing. Still bounded — an agentic loop with no cap will drain the window.

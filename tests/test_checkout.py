@@ -208,3 +208,28 @@ class TestFailureSemantics:
         monkeypatch.setattr("subprocess.run", spy)
         checkout_module._git(["--version"], cwd=tmp_path)
         assert seen.get("timeout") == checkout_module._CLONE_TIMEOUT_SECONDS
+
+
+class TestTheStandardLibraryAlwaysShips:
+    """`go list` reports an empty module path for standard-library packages, because they
+    belong to no module. Leaving them out of the artifact set would let `not_imported`
+    clear a stdlib advisory on the grounds that nothing "imports stdlib" — while the
+    standard library is the one thing always linked in."""
+
+    def test_stdlib_is_added_to_a_go_shipped_set(self, tmp_path: Path) -> None:
+        from harness.analysis.shipped import _STDLIB, go_shipped
+
+        module = tmp_path / "m"
+        module.mkdir()
+        (module / "go.mod").write_text("module example.com/m\n\ngo 1.25.8\n")
+        (module / "main.go").write_text(
+            'package main\n\nimport "fmt"\n\nfunc main() { fmt.Println() }\n'
+        )
+        shipped = go_shipped(module)
+        assert shipped is not None
+        assert _STDLIB in shipped
+
+    def test_a_directory_without_a_module_answers_nothing(self, tmp_path: Path) -> None:
+        from harness.analysis.shipped import go_shipped
+
+        assert go_shipped(tmp_path) is None

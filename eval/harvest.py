@@ -60,7 +60,7 @@ from harness.sources.github import RawAlert
 from harness.sources.local import LocalRepo, local_repo_label
 from harness.sources.osv import OsvClient
 from harness.sources.osv_scan import OsvAlertSource, ScanStats, discover_dependencies
-from harness.versions import at_or_above
+from harness.versions import at_or_above, try_parse
 
 DECONCLUSIVE_DEV_ECOSYSTEMS = frozenset({"maven", "cargo"})
 
@@ -157,7 +157,13 @@ def propose_label(
     )
 
 
-def govulncheck_levels(root: Path) -> dict[str, tuple[int, float, str]]:
+def _dump_key(root: Path) -> str:
+    return re.sub(r"[^A-Za-z0-9]+", "-", str(root.resolve())).strip("-")[-60:]
+
+
+def govulncheck_levels(
+    root: Path, *, dump_dir: Path | None = None
+) -> dict[str, tuple[int, float, str]]:
     """Advisory -> (level, confidence, method) from one whole-program analysis.
 
     Run once per repository rather than once per alert: govulncheck re-analyses the whole
@@ -184,6 +190,14 @@ def govulncheck_levels(root: Path) -> dict[str, tuple[int, float, str]]:
     if proc.returncode not in (0, 3):
         return {}
 
+    key = _dump_key(root)
+    if dump_dir is not None:
+        # Keep the raw analysis. `eval/label.py` reads these rather than re-running the
+        # tool, so the labels and the evidence facts come from one identical analysis
+        # instead of two runs whose inputs could have moved between them.
+        dump_dir.mkdir(parents=True, exist_ok=True)
+        (dump_dir / f"{key}.json").write_text(proc.stdout)
+
     from harness.ecosystems.golang import _iter_json_messages
 
     aliases: dict[str, set[str]] = {}
@@ -201,19 +215,26 @@ def govulncheck_levels(root: Path) -> dict[str, tuple[int, float, str]]:
                 f.get("function") for f in finding.get("trace") or () if f.get("function")
             ]
             if frame_functions:
-                levels[osv_id] = int(ReachabilityLevel.SYMBOL_REFERENCED)
+                # govulncheck only reports call paths it can trace from a program entry
+                # point, so a function frame *is* such a path. Recording it as
+                # SYMBOL_REFERENCED would understate it and make every Go alert abstain.
+                levels[osv_id] = int(ReachabilityLevel.PATH_FROM_ENTRY)
             else:
                 levels.setdefault(osv_id, int(ReachabilityLevel.PRESENT))
 
     out: dict[str, tuple[int, float, str]] = {}
     for osv_id, level in levels.items():
-        confidence = 0.95 if level >= ReachabilityLevel.SYMBOL_REFERENCED else 0.5
+        # Mirrors `GovulncheckReport.to_result` so the case carries what the pipeline
+        # would have recorded, rather than a second opinion about the same output.
+        confidence = 0.95 if level >= ReachabilityLevel.PATH_FROM_ENTRY else 0.9
         for identifier in aliases.get(osv_id, {osv_id}):
             out[identifier] = (level, confidence, "govulncheck")
     return out
 
 
-def harvest(root: Path, *, label: str | None = None, limit: int = 0) -> list[dict[str, object]]:
+def harvest(
+    root: Path, *, label: str | None = None, limit: int = 0, dump_dir: Path | None = None
+) -> list[dict[str, object]]:
     root = root.resolve()
     repo = label or local_repo_label(root)
     host = LocalRepo(root)
@@ -226,7 +247,7 @@ def harvest(root: Path, *, label: str | None = None, limit: int = 0) -> list[dic
     graph = npm_dependency_graph(lockfile) if lockfile else {}
     seeds = _app_seeds(root, "npm", set(graph)) if graph else set()
     shipped = sorted(_closure(graph, seeds)) if graph else None
-    govlevels = govulncheck_levels(root)
+    gov_cache: dict[Path, dict[str, tuple[int, float, str]]] = {}
 
     out: list[dict[str, object]] = []
     scanner_cache: dict[str, set[str] | None] = {}
@@ -283,7 +304,7 @@ def harvest(root: Path, *, label: str | None = None, limit: int = 0) -> list[dic
                     # The fact that makes a clearance justified: what is in the artifact.
                     "shipped_packages": shipped if alert.ecosystem == "npm" else None,
                     "superseded_by": None,
-                    **_evidence_facts(alert, root, govlevels),
+                    **_evidence_facts(alert, root, gov_cache, dump_dir),
                     "_review": {
                         "evidence": evidence.to_dict(),
                         "symbols_known": bool(symbols),
@@ -297,11 +318,29 @@ def harvest(root: Path, *, label: str | None = None, limit: int = 0) -> list[dic
                 break
     finally:
         source.close()
+    annotate_superseded(out)
     return out
 
 
+def _module_dir(root: Path, manifest_path: str) -> Path:
+    """The directory govulncheck should analyse for a Go manifest.
+
+    A repository can hold several modules — airflow ships a Go SDK beside its Python — and
+    analysing the root would answer a question about code the alert is not in. govulncheck
+    is also whole-program, so running it once per module and caching by directory is the
+    difference between one analysis and one per alert.
+    """
+    if not manifest_path:
+        return root
+    parent = (root / manifest_path).parent
+    return parent if parent.is_dir() and parent != root else root
+
+
 def _evidence_facts(
-    alert: RawAlert, root: Path, govlevels: dict[str, tuple[int, float, str]]
+    alert: RawAlert,
+    root: Path,
+    gov_cache: dict[Path, dict[str, tuple[int, float, str]]],
+    dump_dir: Path | None = None,
 ) -> dict[str, object]:
     """What the tooling measured for this alert, as the case's evidence facts.
 
@@ -310,14 +349,28 @@ def _evidence_facts(
     evaluator already distinguishes them, and feeding it a synthetic zero would manufacture
     a clearance that no tool produced.
     """
-    for identifier in (alert.ghsa_id, alert.cve_id):
-        if identifier and identifier in govlevels:
-            level, confidence, method = govlevels[identifier]
-            return {
-                "reachability_level": level,
-                "reachability_confidence": confidence,
-                "reachability_method": method,
-            }
+    if alert.ecosystem in {"go", "gomod"}:
+        module = _module_dir(root, alert.manifest_path)
+        if module not in gov_cache:
+            gov_cache[module] = govulncheck_levels(module, dump_dir=dump_dir)
+        levels = gov_cache[module]
+        # Which module's analysis this is. govulncheck is whole-program, so "the vulnerable
+        # symbol is called" is a statement about one module's build, not about the advisory.
+        # The labeller needs the same key to avoid reading the main module's reachability
+        # onto a submodule case where the symbol is never called.
+        module_key = _dump_key(module)
+        for identifier in (alert.ghsa_id, alert.cve_id):
+            if identifier and identifier in levels:
+                level, confidence, method = levels[identifier]
+                return {
+                    "reachability_level": level,
+                    "reachability_confidence": confidence,
+                    "reachability_method": method,
+                    "_govulncheck_key": module_key,
+                }
+        # A Go alert govulncheck did not mention is an absence of measurement, not a
+        # measurement of absence. Recording nothing is what makes the evaluator abstain.
+        return {}
     adapter = get_adapter(alert.ecosystem)
     if adapter is None:
         return {}
@@ -344,6 +397,32 @@ def _lockfile_text(root: Path) -> str | None:
         except OSError:
             return None
     return None
+
+
+def annotate_superseded(cases: list[dict[str, object]]) -> None:
+    """Fill in `superseded_by` where a newer advisory covers the same package.
+
+    Computed over the harvested set rather than the database so the label pipeline stays
+    independent of the pipeline being measured. Without it the `superseded` rule never
+    fires on the golden set, and a rule with no case cannot be gated.
+    """
+    groups: dict[tuple[str, str], list[dict[str, object]]] = {}
+    for case in cases:
+        groups.setdefault((str(case["purl"]), str(case["manifest_path"])), []).append(case)
+    for group in groups.values():
+        for case in group:
+            mine = try_parse(case.get("patched_version"))  # type: ignore[arg-type]
+            if mine is None:
+                continue
+            newer: list[tuple[object, str]] = []
+            for other in group:
+                if other is case or not other.get("ghsa_id"):
+                    continue
+                theirs = try_parse(other.get("patched_version"))  # type: ignore[arg-type]
+                if theirs is not None and theirs > mine:
+                    newer.append((theirs, str(other["ghsa_id"])))
+            if newer:
+                case["superseded_by"] = max(newer)[1]
 
 
 def _purl(alert: RawAlert) -> str:
@@ -373,9 +452,15 @@ def main() -> int:
     parser.add_argument("--label")
     parser.add_argument("--out", required=True)
     parser.add_argument("--limit", type=int, default=0)
+    parser.add_argument("--dump-govulncheck", help="write the raw analyses here")
     args = parser.parse_args()
 
-    cases = harvest(Path(args.path), label=args.label, limit=args.limit)
+    cases = harvest(
+        Path(args.path),
+        label=args.label,
+        limit=args.limit,
+        dump_dir=Path(args.dump_govulncheck) if args.dump_govulncheck else None,
+    )
     out = Path(args.out)
     out.parent.mkdir(parents=True, exist_ok=True)
     with out.open("w") as handle:

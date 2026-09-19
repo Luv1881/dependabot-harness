@@ -33,6 +33,9 @@ _MODULE_FORMS = (
     re.compile(r"""import\s*\(\s*['"]([^'"]+)['"]\s*\)"""),
 )
 
+_STDLIB = "stdlib"
+"""The pseudo-module name for the Go standard library, matching OSV's."""
+
 _GO_TIMEOUT_SECONDS = 300
 
 
@@ -168,7 +171,12 @@ def go_shipped(root: Path) -> set[str] | None:
     if proc.returncode != 0:
         return None
     modules = {line.strip() for line in proc.stdout.splitlines() if line.strip()}
-    return modules or None
+    # Standard-library packages belong to no module, so `go list` reports an empty module
+    # path for them. They are unconditionally in the artifact, and leaving them out would
+    # let `not_imported` clear a stdlib advisory on the grounds that nothing "imports
+    # stdlib" — while the standard library is the one thing always linked in.
+    modules.add(_STDLIB)
+    return modules
 
 
 def shipped_packages(root: Path, ecosystem: str) -> set[str] | None:

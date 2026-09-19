@@ -193,6 +193,8 @@ class Database:
         self._conn.executescript(_SCHEMA)
         self._add_column_if_missing("verdicts", "structure_hash", "TEXT")
         self._add_column_if_missing("budget_ledger", "priced", "INTEGER")
+        self._add_column_if_missing("budget_ledger", "tokens_in", "INTEGER")
+        self._add_column_if_missing("budget_ledger", "tokens_out", "INTEGER")
         self._conn.execute(
             "INSERT INTO schema_meta(key, value) VALUES('version', ?) "
             "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
@@ -487,17 +489,53 @@ class Database:
         cost_usd: float,
         alert_key: str | None = None,
         priced: bool = True,
+        tokens_in: int = 0,
+        tokens_out: int = 0,
     ) -> None:
         """Every model call lands here. Recon uses ``alert_key=None`` (repo-level).
 
         ``priced`` distinguishes a modelled cost from a placeholder zero. Without it a
         run on a model whose rates are unknown reports `$0.00` and looks free.
+
+        Tokens are recorded alongside the cost because they are the one quantity a run
+        always knows. Cost needs a price list; tokens need nothing, so they are what a cap
+        can be enforced against when pricing is unavailable.
         """
         self._conn.execute(
-            "INSERT INTO budget_ledger(run_id, repo, alert_key, stage, cost_usd, at, priced) "
-            "VALUES(?,?,?,?,?,?,?)",
-            (run_id, repo, alert_key, stage, cost_usd, utcnow(), int(priced)),
+            "INSERT INTO budget_ledger"
+            "(run_id, repo, alert_key, stage, cost_usd, at, priced, tokens_in, tokens_out) "
+            "VALUES(?,?,?,?,?,?,?,?,?)",
+            (
+                run_id,
+                repo,
+                alert_key,
+                stage,
+                cost_usd,
+                utcnow(),
+                int(priced),
+                int(tokens_in),
+                int(tokens_out),
+            ),
         )
+
+    def tokens(
+        self, run_id: str, *, repo: str | None = None, alert_key: str | None = None
+    ) -> int:
+        """Input plus output tokens spent, at the same scopes as :meth:`spend`."""
+        clauses = ["run_id=?"]
+        params: list[Any] = [run_id]
+        if repo is not None:
+            clauses.append("repo=?")
+            params.append(repo)
+        if alert_key is not None:
+            clauses.append("alert_key=?")
+            params.append(alert_key)
+        row = self._conn.execute(
+            "SELECT COALESCE(SUM(COALESCE(tokens_in, 0) + COALESCE(tokens_out, 0)), 0) AS t "
+            f"FROM budget_ledger WHERE {' AND '.join(clauses)}",
+            params,
+        ).fetchone()
+        return int(row["t"])
 
     def unpriced_calls(self, run_id: str) -> int:
         """Calls whose cost could not be computed, so the spend total is not a measurement."""

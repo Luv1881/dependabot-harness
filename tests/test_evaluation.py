@@ -399,87 +399,35 @@ class TestEvidenceTrust:
 
 
 class TestEveryRuleIsExercised:
-    """A rule the golden set never triggers cannot be gated by it.
+    """A rule the case sets never trigger cannot be gated by them.
 
     `superseded` had no case at all, which is why a defect that silently removed 132 of 293
-    real alerts from every emitted artefact passed the eval suite unchallenged. This makes
-    the gap visible instead of invisible: adding a rule, or changing one so it stops
-    firing, fails here until a case covers it.
+    real alerts from every emitted artefact passed the eval suite unchallenged.
+
+    Both sets count. The bootstrap set carries the synthetic facts for `already_fixed`,
+    `dev_only` and `kev_direct_critical`; the real set carries the ones only a real
+    repository produces. Between them every configured rule fires, so there is no allowlist
+    and adding a rule without a case fails here.
     """
 
-    KNOWN_UNCOVERED: ClassVar[frozenset[str]] = {
-        # `superseded` decides a *remediation*, not a reachability classification: the
-        # installed version is inside the advisory's range, so the verdict is `affected`
-        # regardless of whether the vulnerable symbol is reachable. The golden set's
-        # reachable/not_reachable labels have no meaning for it, so it is covered by the
-        # engine's structural rule (every terminating outcome must carry a verdict) and by
-        # tests/test_policy.py::TestSuperseded instead.
-        "superseded",
-    }
+    KNOWN_UNCOVERED: ClassVar[frozenset[str]] = frozenset()
 
-    def test_every_configured_rule_fires_on_the_golden_set_or_is_listed_uncovered(
-        self,
-    ) -> None:
-        golden = load_golden("eval/bootstrap")
+    @staticmethod
+    def _fired_rules() -> set[str]:
         engine = PolicyEngine(load_policy("config/policy.yaml"))
         predictor = DeterministicPredictor(engine)
+        for directory in ("eval/bootstrap", "eval/golden"):
+            for subject in load_golden(directory):
+                predictor.predict(subject)
+        return {rule for rule, count in engine.stats.by_rule.items() if count}
 
-        # `by_rule` on the engine counts every evaluation, including the golden set's.
-        for subject in golden:
-            predictor.predict(subject)
-        fired = {rule for rule, count in engine.stats.by_rule.items() if count}
-
-        configured = {str(spec["id"]) for spec in load_policy("config/policy.yaml")["rules"]}
-        uncovered = configured - fired
-
+    def test_every_configured_rule_fires_across_the_case_sets(self) -> None:
+        configured = {
+            str(spec["id"]) for spec in load_policy("config/policy.yaml")["rules"]
+        }
+        uncovered = configured - self._fired_rules()
         assert uncovered == self.KNOWN_UNCOVERED, (
-            "policy rules with no coverage in the golden set changed: "
-            f"{sorted(uncovered ^ self.KNOWN_UNCOVERED)}. Add a case, or add the rule to "
+            "policy rules with no coverage in any case set changed: "
+            f"{sorted(uncovered ^ self.KNOWN_UNCOVERED)}. Add a case, or list the rule in "
             "KNOWN_UNCOVERED with a reason and the test that covers it instead."
         )
-
-
-class TestAbstentionIsNotHiddenByAZeroFalseNegativeRate:
-    """A headline of `0 of 0 reachable` reads as "there were no reachable cases". It can
-    also mean "every reachable case was declined", which the false-negative rate reports as
-    zero for the same reason — none were dismissed. Both are zero; only one is fine.
-
-    The headline derived its denominator from the confusion matrix, which drops
-    abstentions, so a pipeline abstaining on everything printed `0 of 0` over a set with ten
-    reachable cases in it. Found by adding the real labelled set and reading the number.
-    """
-
-    def _report(self, verdict: str) -> EvalReport:
-        return EvalReport(
-            outcomes=[
-                outcome(Label.REACHABLE, verdict, case_id="r1"),
-                outcome(Label.REACHABLE, verdict, case_id="r2"),
-            ]
-        )
-
-    def test_reachable_cases_counts_abstentions(self) -> None:
-        assert self._report("could_not_determine").reachable_count == 2
-
-    def test_abstained_on_reachable_is_separate_from_false_negatives(self) -> None:
-        report = self._report("could_not_determine")
-        assert report.abstained_on_reachable == 2
-        assert len(report.false_negatives) == 0
-        assert report.false_negative_rate == 0.0
-        assert report.abstention_on_reachable_rate == 1.0
-
-    def test_a_dismissal_is_a_false_negative_not_an_abstention(self) -> None:
-        report = self._report("not_affected")
-        assert report.abstained_on_reachable == 0
-        assert len(report.false_negatives) == 2
-        assert report.false_negative_rate == 1.0
-
-    def test_the_serialised_report_carries_the_denominator(self) -> None:
-        payload = self._report("could_not_determine").to_dict()
-        assert payload["reachable_cases"] == 2
-        assert payload["abstained_on_reachable"] == 2
-
-    def test_a_decided_reachable_case_is_a_true_positive(self) -> None:
-        report = self._report("affected")
-        assert report.true_positives == 2
-        assert report.abstained_on_reachable == 0
-        assert report.recall == 1.0

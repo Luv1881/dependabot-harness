@@ -176,12 +176,26 @@ colleague's branch, or checking the harness itself. It never writes to the tree 
 given, and `structure_hash` is derived from the watched files' contents with the same
 invalidation semantics as the API-backed version.
 
-### Budgets need prices
+### Budgets
 
-The USD caps are only as good as the cost figures feeding them. A model outside the
-built-in table is reported as **unpriced**, and because the ledger then sums zeros the
-caps cannot fire — so an unpriced call is counted and reported rather than shown as
-`$0.00`, and startup warns by name. Declare the rates to switch enforcement on:
+Two independent caps, both enforced at run, repo and alert scope. The **token** caps are
+not a fallback — they are the ones that hold when the price list cannot: an unpriced call
+contributes zero to the dollar total, so a threshold on dollars is never reached. Tokens
+are always known.
+
+```yaml
+budgets:
+  per_repo_usd: 5.00
+  per_alert_usd: 0.40
+  per_run_usd: 100.00
+  per_repo_tokens: 4000000
+  per_alert_tokens: 400000
+  per_run_tokens: 40000000
+```
+
+A model outside the built-in table is still reported as **unpriced** — `unpriced_calls` and
+`spend_is_complete` in the report, and a warning at startup — because `$0.00` must never be
+mistaken for "free". Declare the rates for exact dollar accounting:
 
 ```yaml
 models:
@@ -202,6 +216,24 @@ The eval harness gates every prompt, rule and threshold change.
 python eval/build_seed_set.py            # synthetic bootstrap set
 python eval/run_eval.py                  # exits 2 unless the set is hand-labeled
 ```
+
+The set in `eval/golden/` is **636 hand-labelled real alerts**, every one carrying the
+rationale for its label. Labels come from evidence the pipeline never produced:
+independent import and dependency-graph analysis, and — for Go — `govulncheck`
+whole-program call-path analysis. `eval/bootstrap/` holds the older synthetic set,
+kept separate so it cannot dilute a rate computed over real cases.
+
+```bash
+python eval/harvest.py --path <checkout> --label org/repo --out /tmp/rev.jsonl
+python eval/label.py --review /tmp/rev.jsonl --govulncheck-dir /tmp/dumps \
+                    --out eval/golden/real.jsonl
+python eval/run_eval.py --golden eval/golden
+```
+
+Current numbers on the real set: **FN 0.00% (0 of 46 reachable), abstention 0.0%,
+precision 0.767, recall 1.000, FP 11.2%**. The false positives are the conservative
+`affected` verdicts from `superseded` and `trivial_patch` landing on alerts whose
+vulnerable symbol is not in fact reachable — a real cost, now measured rather than hidden.
 
 **False-negative rate is the metric that matters most** — wrongly dismissing a live
 vulnerability is worse than having no tool at all. A change that improves cost while

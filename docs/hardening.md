@@ -479,6 +479,57 @@ smaller than they should have been. Measured on a clean database:
 
 `dependabot/demo` likewise went from 3 emitted statements to 6.
 
+## Round four — what the labelled set then found
+
+Round three ended with the admission that the eval set was synthetic and the gates were
+comparing synthetic to synthetic. Building a real one immediately paid for itself.
+
+### 25. Go standard-library advisories were invisible to discovery — high
+
+Stdlib advisories are keyed to the toolchain version, and nothing in a `require` block
+mentions the standard library — so a discovery pass that reads `go.mod`'s requires could
+not see any of them. On prometheus, **7 of the 9 advisories govulncheck found a live call
+path for were stdlib**, and every one was invisible.
+
+`GoAdapter.parse_dependencies` now emits the toolchain's `stdlib` as a dependency, read
+from `toolchain` or the `go` directive. Prometheus pins `go 1.25.8`, so the version is
+exact; a bare `1.25` is used verbatim rather than padded, because OSV cannot match a
+version it does not know and an unmatched version is indistinguishable from no advisories.
+
+The same change would have created a *new* false negative: nothing "imports stdlib", so
+`not_imported` would have cleared stdlib advisories as `vulnerable_code_not_present`.
+`go_shipped` therefore always includes the standard library, because it is the one thing
+unconditionally linked into the artifact.
+
+Measured on prometheus:
+
+| | before | after |
+|---|---:|---:|
+| dependencies | 537 | 542 |
+| advisories | 87 | **217** |
+| evidence toolchain failures | 10 | 4 |
+| repo flagged `shallow` | True | **False** |
+
+`tests/test_ecosystems.py::TestGoStdlibIsDiscovered`,
+`tests/test_checkout.py::TestTheStandardLibraryAlwaysShips`
+
+### 26. Evidence levels from govulncheck understated proven call paths — medium
+
+The label pipeline recorded a function-bearing govulncheck finding as
+`SYMBOL_REFERENCED` (3) when the adapter correctly calls it `PATH_FROM_ENTRY` (4).
+govulncheck only reports call paths it can trace from a program entry point, so a function
+frame *is* such a path. At level 3 the evaluator abstains, so every Go case abstained.
+`tests/test_evaluation.py`, `eval/harvest.py`
+
+### 27. Budget caps were inert on any unpriced model — high (closes round-three gap)
+
+A dollar cap is only as good as the price list behind it, and an unpriced call contributes
+zero to the ledger, so a threshold on the dollar total is never reached. Token caps are now
+declared alongside the dollar caps and enforced at the same three scopes. Tokens are always
+known, so they are the cap that holds when pricing cannot.
+
+`tests/test_models.py::TestTokenCapsHoldWhenPricingCannot`
+
 ## Gating
 
 The eval set gates the two rule changes in this audit (`is_pinned`, `purl_package_name`),

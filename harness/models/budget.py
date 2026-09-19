@@ -106,7 +106,13 @@ class BudgetLedger:
         self.action = BreachAction(cfg.on_breach)
 
     def check(self, *, repo: str, alert_key: str | None = None) -> BudgetDecision:
-        """Whether another call is permitted at run, repo and alert scope."""
+        """Whether another call is permitted at run, repo and alert scope.
+
+        Dollar caps are checked first, then token caps. The token caps are not a fallback
+        for a missing price list — they are the cap that holds when the price list cannot,
+        because on an unpriced model every dollar figure is a placeholder zero and a
+        threshold on zero never trips.
+        """
         run_spent = self.db.spend(self.run_id)
         if run_spent >= self.cfg.per_run_usd:
             return self._breach("run", run_spent, self.cfg.per_run_usd)
@@ -119,6 +125,21 @@ class BudgetLedger:
             alert_spent = self.db.spend(self.run_id, alert_key=alert_key)
             if alert_spent >= self.cfg.per_alert_usd:
                 return self._breach("alert", alert_spent, self.cfg.per_alert_usd)
+
+        if self.cfg.per_run_tokens is not None:
+            run_tokens = self.db.tokens(self.run_id)
+            if run_tokens >= self.cfg.per_run_tokens:
+                return self._breach("run_tokens", run_tokens, self.cfg.per_run_tokens)
+
+        if self.cfg.per_repo_tokens is not None:
+            repo_tokens = self.db.tokens(self.run_id, repo=repo)
+            if repo_tokens >= self.cfg.per_repo_tokens:
+                return self._breach("repo_tokens", repo_tokens, self.cfg.per_repo_tokens)
+
+        if alert_key is not None and self.cfg.per_alert_tokens is not None:
+            alert_tokens = self.db.tokens(self.run_id, alert_key=alert_key)
+            if alert_tokens >= self.cfg.per_alert_tokens:
+                return self._breach("alert_tokens", alert_tokens, self.cfg.per_alert_tokens)
 
         return BudgetDecision(allowed=True, action=self.action)
 
@@ -151,6 +172,8 @@ class BudgetLedger:
             cost_usd=cost,
             alert_key=alert_key,
             priced=priced,
+            tokens_in=usage.tokens_in + usage.cache_read_tokens + usage.cache_write_tokens,
+            tokens_out=usage.tokens_out,
         )
         return cost
 
@@ -159,12 +182,16 @@ class BudgetLedger:
         return {
             "run_id": self.run_id,
             "spend_usd": round(self.db.spend(self.run_id), 6),
+            "tokens": self.db.tokens(self.run_id),
             "unpriced_calls": unpriced,
             "spend_is_complete": unpriced == 0,
             "caps": {
                 "per_run_usd": self.cfg.per_run_usd,
                 "per_repo_usd": self.cfg.per_repo_usd,
                 "per_alert_usd": self.cfg.per_alert_usd,
+                "per_run_tokens": self.cfg.per_run_tokens,
+                "per_repo_tokens": self.cfg.per_repo_tokens,
+                "per_alert_tokens": self.cfg.per_alert_tokens,
             },
             "on_breach": self.action.value,
         }

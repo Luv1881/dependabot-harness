@@ -25,6 +25,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+from harness.ecosystems.base import ReachabilityLevel
 from harness.ecosystems.golang import _iter_json_messages
 from harness.evaluation.dataset import GoldenCase
 
@@ -33,7 +34,7 @@ LABELS = {"reachable", "not_reachable", "unsure"}
 GOLDEN_FIELDS = frozenset(GoldenCase.__dataclass_fields__)
 
 
-def govulncheck_labels(path: str | None) -> dict[str, str]:
+def govulncheck_labels(path: str | None) -> dict[str, tuple[str, int]]:
     """Every identifier of every assessed advisory -> label.
 
     Keyed on *all* aliases, not the primary id. govulncheck reports Go's own ``GO-2026-…``
@@ -52,6 +53,7 @@ def govulncheck_labels(path: str | None) -> dict[str, str]:
     aliases: dict[str, set[str]] = {}
     reachable: set[str] = set()
     assessed: set[str] = set()
+    levels: dict[str, int] = {}
     for message in _iter_json_messages(Path(path).read_text()):
         if "osv" in message:
             osv = message["osv"]
@@ -64,16 +66,25 @@ def govulncheck_labels(path: str | None) -> dict[str, str]:
             assessed.add(osv_id)
             if any(frame.get("function") for frame in finding.get("trace") or ()):
                 reachable.add(osv_id)
+                levels[osv_id] = int(ReachabilityLevel.PATH_FROM_ENTRY)
+            else:
+                levels.setdefault(osv_id, int(ReachabilityLevel.PRESENT))
 
-    labels: dict[str, str] = {}
+    out: dict[str, tuple[str, int]] = {}
     for osv_id in assessed:
         label = "reachable" if osv_id in reachable else "not_reachable"
+        level = levels.get(osv_id, int(ReachabilityLevel.PRESENT))
         for identifier in aliases.get(osv_id, {osv_id}):
-            labels[identifier] = label
-    return labels
+            out[identifier] = (label, level)
+    return out
 
 
-def build(review_files: list[str], govuln: dict[str, str]) -> list[dict[str, object]]:
+def build(
+    review_files: list[str],
+    govuln: dict[str, tuple[str, int]],
+    by_module: dict[str, dict[str, tuple[str, int]]] | None = None,
+) -> list[dict[str, object]]:
+    by_module = by_module or {}
     out: list[dict[str, object]] = []
     seen: Counter[str] = Counter()
     for path in review_files:
@@ -82,23 +93,34 @@ def build(review_files: list[str], govuln: dict[str, str]) -> list[dict[str, obj
                 continue
             entry = json.loads(line)
             review = entry.pop("_review")
+            module_key = str(review.pop("_govulncheck_key", ""))
             label = review.get("proposed_label")
             rationale = review.get("rationale", "")
 
+            # Match the analysis that covers this alert's own module when there is one,
+            # so a submodule case is not labelled with the main module's call paths.
+            scoped = by_module.get(module_key, {})
             ground_truth = next(
                 (
-                    govuln[ident]
+                    source[ident]
+                    for source in (scoped, govuln)
                     for ident in (
                         entry.get("ghsa_id"),
                         entry.get("cve_id"),
                         entry.get("osv_id"),
                     )
-                    if ident and ident in govuln
+                    if ident and ident in source
                 ),
                 None,
             )
             if entry["ecosystem"] in {"go", "gomod"} and ground_truth:
-                label = ground_truth
+                label, level = ground_truth
+                # The evidence fact is corrected from the same analysis. A stale level here
+                # is not cosmetic: it is what the evaluator reads to decide whether the
+                # pipeline would have escalated or abstained.
+                entry["reachability_level"] = level
+                entry["reachability_method"] = "govulncheck"
+                entry["reachability_confidence"] = 0.95 if level >= 4 else 0.9
                 rationale = (
                     "govulncheck whole-program call-path analysis: "
                     + (
@@ -138,6 +160,9 @@ def build(review_files: list[str], govuln: dict[str, str]) -> list[dict[str, obj
                 "imports_scanned",
                 "shipped_packages",
                 "superseded_by",
+                "reachability_level",
+                "reachability_confidence",
+                "reachability_method",
             ):
                 if field in entry and entry[field] is not None:
                     case[field] = entry[field]
@@ -149,7 +174,11 @@ def build(review_files: list[str], govuln: dict[str, str]) -> list[dict[str, obj
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--review", action="append", required=True)
-    parser.add_argument("--govulncheck")
+    parser.add_argument("--govulncheck", action="append")
+    parser.add_argument(
+        "--govulncheck-dir",
+        help="directory of raw govulncheck analyses to merge as ground truth",
+    )
     parser.add_argument("--out", required=True)
     parser.add_argument(
         "--shipped-from",
@@ -157,7 +186,12 @@ def main() -> int:
     )
     args = parser.parse_args()
 
-    govuln = govulncheck_labels(args.govulncheck)
+    sources = list(args.govulncheck or [])
+    if args.govulncheck_dir:
+        sources.extend(sorted(str(p) for p in Path(args.govulncheck_dir).glob("*.json")))
+    govuln: dict[str, str] = {}
+    for source in sources:
+        govuln.update(govulncheck_labels(source))
     if govuln:
         counts = Counter(govuln.values())
         print(f"govulncheck ground truth: {dict(counts)}", file=sys.stderr)

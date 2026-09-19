@@ -36,6 +36,11 @@ budgets:
   per_repo_usd: 5.00
   per_alert_usd: 0.40
   per_run_usd: 100.00
+  # Token caps are enforced alongside the USD caps. They matter most on a model whose
+  # rates are not declared, where every dollar figure is a placeholder zero.
+  per_repo_tokens: 4000000
+  per_alert_tokens: 400000
+  per_run_tokens: 40000000
   judgment_max_tool_calls: 8
   on_breach: queue_next_run    # queue_next_run | fail | warn
 

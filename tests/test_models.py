@@ -838,3 +838,139 @@ class TestContextEstimateIsPessimistic:
     def test_estimate_does_not_undershoot_a_conservative_ratio(self) -> None:
         request = ModelRequest(system="x" * 3000, user="")
         assert request.estimated_tokens() >= 1000
+
+
+class TestTokenCapsHoldWhenPricingCannot:
+    """A dollar cap is only as good as the price list behind it.
+
+    On an unpriced model every cost figure is a placeholder zero, so a threshold on the
+    dollar total is never reached and every cap is silently inert — 36 paid DeepSeek calls
+    recorded `spend_usd: $0.000000`. Tokens are known regardless, so they are the cap that
+    fires when pricing cannot.
+    """
+
+    def test_an_unpriced_call_still_consumes_the_token_budget(self, db: Database) -> None:
+        from harness.models import BudgetLedger
+
+        ledger = BudgetLedger(budget_cfg(per_alert_tokens=100), db, "run1")
+        ledger.record(
+            repo="org/a",
+            stage="recon",
+            model="deepseek-flash",
+            usage=Usage(tokens_in=150, tokens_out=50),
+            alert_key="k1",
+        )
+        assert db.tokens("run1") == 200
+        assert db.tokens("run1", alert_key="k1") == 200
+        decision = ledger.check(repo="org/a", alert_key="k1")
+        assert decision.allowed is False
+        assert decision.scope == "alert_tokens"
+
+    def test_the_dollar_cap_cannot_fire_on_an_unpriced_model(self, db: Database) -> None:
+        """The behaviour the token cap exists to cover."""
+        from harness.models import BudgetLedger
+
+        ledger = BudgetLedger(budget_cfg(per_alert_usd=0.01), db, "run1")
+        ledger.record(
+            repo="org/a",
+            stage="recon",
+            model="deepseek-flash",
+            usage=Usage(tokens_in=10_000_000, tokens_out=1_000_000),
+            alert_key="k1",
+        )
+        assert db.spend("run1") == 0.0
+        assert ledger.check(repo="org/a", alert_key="k1").allowed is True
+        assert db.unpriced_calls("run1") == 1
+
+    def test_a_priced_model_consumes_both_budgets(self, db: Database) -> None:
+        from harness.models import BudgetLedger
+
+        ledger = BudgetLedger(
+            budget_cfg(per_run_tokens=100_000, per_repo_tokens=50_000), db, "run1"
+        )
+        ledger.record(
+            repo="org/a",
+            stage="recon",
+            model="claude-opus-5",
+            usage=Usage(tokens_in=20_000, tokens_out=5_000),
+        )
+        assert db.tokens("run1") == 25_000
+        assert ledger.check(repo="org/a").allowed is True
+
+    def test_run_scope_is_checked_before_repo_scope(self, db: Database) -> None:
+        from harness.models import BudgetLedger
+
+        ledger = BudgetLedger(
+            budget_cfg(per_run_tokens=10, per_repo_tokens=1_000_000), db, "run1"
+        )
+        ledger.record(
+            repo="org/a", stage="recon", model="claude-opus-5", usage=Usage(tokens_in=50)
+        )
+        assert ledger.check(repo="org/a").scope == "run_tokens"
+
+    def test_no_token_cap_configured_means_no_token_check(self, db: Database) -> None:
+        """An unpriced model, so no dollar cap can fire and the token behaviour is isolated."""
+        from harness.models import BudgetLedger
+
+        ledger = BudgetLedger(budget_cfg(), db, "run1")
+        ledger.record(
+            repo="org/a",
+            stage="recon",
+            model="deepseek-flash",
+            usage=Usage(tokens_in=100_000_000),
+        )
+        assert db.spend("run1") == 0.0
+        assert ledger.check(repo="org/a").allowed is True
+
+    def test_the_report_carries_tokens_and_the_token_caps(self, db: Database) -> None:
+        from harness.models import BudgetLedger
+
+        ledger = BudgetLedger(budget_cfg(per_run_tokens=4_000_000), db, "run1")
+        ledger.record(
+            repo="org/a",
+            stage="recon",
+            model="deepseek-flash",
+            usage=Usage(tokens_in=300, tokens_out=200),
+        )
+        report = ledger.report()
+        assert report["tokens"] == 500
+        assert report["caps"]["per_run_tokens"] == 4_000_000
+
+    def test_cache_tokens_count_toward_the_cap(self, db: Database) -> None:
+        """A cached read is still tokens the model processed and still billable."""
+        from harness.models import BudgetLedger
+
+        ledger = BudgetLedger(budget_cfg(per_run_tokens=1000), db, "run1")
+        ledger.record(
+            repo="org/a",
+            stage="recon",
+            model="claude-opus-5",
+            usage=Usage(tokens_in=0, tokens_out=0, cache_read_tokens=900),
+        )
+        assert db.tokens("run1") == 900
+
+    def test_a_non_positive_token_cap_is_refused_at_config_time(self) -> None:
+        with pytest.raises(ConfigError, match="must be positive"):
+            BudgetConfig(
+                per_repo_usd=1.0,
+                per_alert_usd=1.0,
+                per_run_usd=1.0,
+                judgment_max_tool_calls=8,
+                on_breach="warn",
+                per_run_tokens=0,
+            )
+
+    def test_token_caps_are_read_from_config(self, tmp_path: Path) -> None:
+        text = BASE_CONFIG.replace(
+            "budgets: {per_repo_usd: 5.0, per_alert_usd: 0.4, per_run_usd: 100.0}",
+            "budgets: {per_repo_usd: 5.0, per_alert_usd: 0.4, per_run_usd: 100.0, "
+            "per_repo_tokens: 10, per_alert_tokens: 20, per_run_tokens: 30}",
+        )
+        path = tmp_path / "h.yaml"
+        path.write_text(text)
+        budgets = load_config(path, require_github_auth=False).budgets
+        assert (budgets.per_repo_tokens, budgets.per_alert_tokens, budgets.per_run_tokens) == (
+            10,
+            20,
+            30,
+        )

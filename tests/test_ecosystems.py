@@ -397,3 +397,45 @@ class TestIsPinned:
     )
     def test_a_range_or_reference_is_not_pinned(self, version: str) -> None:
         assert Dependency(name="x", version=version).is_pinned is False
+
+
+class TestGoStdlibIsDiscovered:
+    """The standard library is a dependency and `go.mod` is the only place that says so.
+
+    Stdlib advisories are keyed to the toolchain version, and nothing in a `require` block
+    mentions them — so leaving stdlib out means an entire class of reachable
+    vulnerabilities is never discovered. On prometheus, 7 of the 9 advisories govulncheck
+    found a live call path for were stdlib, and discovery could not see any of them.
+    """
+
+    def test_the_go_directive_becomes_a_stdlib_dependency(self) -> None:
+        text = "module m\n\ngo 1.25.8\n\nrequire github.com/a/b v1.2.3\n"
+        found = {d.name: d for d in GoAdapter().parse_dependencies(text)}
+        assert found["stdlib"].version == "1.25.8"
+        assert found["stdlib"].scope == Scope.RUNTIME
+        assert found["stdlib"].is_direct is None
+
+    def test_an_explicit_toolchain_directive_wins(self) -> None:
+        text = "module m\n\ngo 1.24\n\ntoolchain go1.25.8\n"
+        found = {d.name: d for d in GoAdapter().parse_dependencies(text)}
+        assert found["stdlib"].version == "1.25.8"
+
+    def test_a_major_minor_directive_is_used_verbatim(self) -> None:
+        """Never padded or guessed at: OSV cannot match a version it does not know, and an
+        unmatched version is indistinguishable from no advisories."""
+        text = "module m\n\ngo 1.25\n"
+        found = {d.name: d for d in GoAdapter().parse_dependencies(text)}
+        assert found["stdlib"].version == "1.25"
+
+    def test_a_manifest_with_no_go_directive_yields_no_stdlib_entry(self) -> None:
+        found = GoAdapter().parse_dependencies("module m\n")
+        assert not [d for d in found if d.name == "stdlib"]
+
+    def test_the_stdlib_entry_carries_the_directive_not_a_default(self) -> None:
+        text = "module m\n\ngo 1.21.0\n"
+        found = {d.name: d for d in GoAdapter().parse_dependencies(text)}
+        assert found["stdlib"].version == "1.21.0"
+
+    def test_a_free_form_go_line_is_not_mistaken_for_a_directive(self) -> None:
+        found = GoAdapter().parse_dependencies("module m\n// the go directive is absent\n")
+        assert not [d for d in found if d.name == "stdlib"]

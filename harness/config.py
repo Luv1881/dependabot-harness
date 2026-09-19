@@ -119,10 +119,24 @@ class BudgetConfig:
     per_run_usd: float
     judgment_max_tool_calls: int
     on_breach: str
+    per_repo_tokens: int | None = None
+    per_alert_tokens: int | None = None
+    per_run_tokens: int | None = None
+    """Token caps, enforced alongside the dollar caps.
+
+    A dollar cap is only as good as the price list behind it, and a model whose rates are
+    unknown contributes zero to the ledger — so on an unpriced model the dollar caps cannot
+    fire at all. Tokens are always known, so they are the cap that works regardless of
+    whether anyone has declared a price.
+    """
 
     def __post_init__(self) -> None:
         if self.on_breach not in {"queue_next_run", "fail", "warn"}:
             raise ConfigError(f"budgets.on_breach: unknown value {self.on_breach!r}")
+        for name in ("per_repo_tokens", "per_alert_tokens", "per_run_tokens"):
+            value = getattr(self, name)
+            if value is not None and value <= 0:
+                raise ConfigError(f"budgets.{name} must be positive when set, got {value}")
 
 
 @dataclass(frozen=True)
@@ -169,6 +183,10 @@ def _require(mapping: dict[str, Any], key: str, where: str) -> Any:
     if key not in mapping:
         raise ConfigError(f"{where}: missing required key {key!r}")
     return mapping[key]
+
+
+def _optional_int(node: Any) -> int | None:
+    return None if node is None else int(node)
 
 
 def _pricing(node: Any) -> tuple[float, float] | None:
@@ -249,6 +267,9 @@ def load_config(
         per_run_usd=float(_require(budgets_raw, "per_run_usd", "budgets")),
         judgment_max_tool_calls=int(budgets_raw.get("judgment_max_tool_calls", 8)),
         on_breach=str(budgets_raw.get("on_breach", "queue_next_run")),
+        per_repo_tokens=_optional_int(budgets_raw.get("per_repo_tokens")),
+        per_alert_tokens=_optional_int(budgets_raw.get("per_alert_tokens")),
+        per_run_tokens=_optional_int(budgets_raw.get("per_run_tokens")),
     )
 
     cache_raw = _require(raw, "cache", str(path))

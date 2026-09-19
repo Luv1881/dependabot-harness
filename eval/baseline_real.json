@@ -1,51 +1,52 @@
 {
   "split": "tune",
-  "total_cases": 340,
-  "decidable_cases": 131,
-  "dataset_fingerprint": "9d23718fa19e121c",
-  "reachable_cases": 10,
-  "abstained_on_reachable": 10,
-  "abstention_on_reachable_rate": 1.0,
+  "total_cases": 513,
+  "decidable_cases": 171,
+  "dataset_fingerprint": "afb0cf114560d2d3",
+  "reachable_cases": 46,
+  "abstained_on_reachable": 0,
+  "abstention_on_reachable_rate": 0.0,
   "false_negative_rate": 0.0,
   "false_negatives": 0,
-  "false_positive_rate": 0.0579,
-  "false_positives": 7,
-  "could_not_determine_rate": 0.3053,
-  "precision": 0.0,
-  "recall": 0.0,
+  "false_positive_rate": 0.112,
+  "false_positives": 14,
+  "could_not_determine_rate": 0.0,
+  "precision": 0.7667,
+  "recall": 1.0,
   "mean_cost_per_alert_usd": 0.0,
   "validator_disagreement_rate": 0.0,
   "confusion": {
-    "true_positive": 0,
-    "false_positive": 7,
-    "true_negative": 84,
+    "true_positive": 46,
+    "false_positive": 14,
+    "true_negative": 111,
     "false_negative": 0
   },
   "decided_by": {
-    "policy": 142,
-    "unresolved": 198
+    "policy": 388,
+    "unresolved": 90,
+    "evidence": 35
   },
   "false_negative_cases": [],
   "predictor": "deterministic",
   "dataset": {
-    "total": 414,
-    "scored": 340,
+    "total": 636,
+    "scored": 513,
     "labels": {
-      "not_reachable": 144,
-      "unsure": 254,
-      "reachable": 16
+      "not_reachable": 148,
+      "unsure": 423,
+      "reachable": 65
     },
     "ecosystems": {
       "npm": 300,
-      "go": 104,
+      "go": 326,
       "pip": 10
     },
-    "hand_labeled": 414,
+    "hand_labeled": 636,
     "synthetic": 0
   },
   "accept_gate": {
     "requires_hand_labeled_cases": 100,
-    "hand_labeled_present": 414,
+    "hand_labeled_present": 636,
     "satisfied": true,
     "note": "hand-labeled set meets the required size"
   }
